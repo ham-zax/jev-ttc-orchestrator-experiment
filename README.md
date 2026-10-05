@@ -4,55 +4,62 @@ Planning repository for a small, practical multi-agent coding experiment.
 
 ## Experiment question
 
-Can a lightweight orchestration layer improve on a single coding agent by using:
+Does **refining** a coding agent's work beat **resampling** it, and can a lightweight orchestration layer decide cheaply when to spend extra compute?
 
-- Jev for cheap bounded routing and supervision signals,
-- deterministic code for policy and side effects,
-- Codex / OpenCode / Pi as coding workers,
-- objective verification when available,
-- one local repair before restart,
-- and a two-candidate hard mode only when breadth is worth the cost?
+The layer combines:
+
+- Codex / OpenCode / Pi / Claude Code as interchangeable coding workers,
+- objective verification as the arbiter of correctness,
+- a verifier-gated refinement loop (explicit critique, then correction, then verification) as the first escalation,
+- a second, deliberately different candidate only when refinement stalls,
+- Jev for cheap bounded decision signals, measured against a rules-only baseline,
+- deterministic code for policy, budgets, and side effects.
+
+The design follows *Refining Over Resampling* (arXiv 2608.05643), adapted from small-model math reasoning to frontier coding agents. See `docs/00-rationale.md` §"What we take from the paper" for what carries over and what doesn't.
 
 ## Current status
 
-**Planning complete; implementation has not started.**
+**Planning revised (revision 2); implementation has not started.**
 
-This repository was created on WebHarness ARM. The next implementation phase is designed to move to the actual WebHMF workstation, inspect the real installed Codex/OpenCode/Pi interfaces, and implement adapters from observed capabilities rather than assumptions.
+This repository was created on WebHarness ARM. The implementation is designed to run on the actual WebHMF workstation, where the installed Codex / OpenCode / Pi / Claude Code interfaces must be inspected before writing worker adapters.
 
 ## Read in order
 
 1. [Takeover and implementation rules](AGENTS.md)
-2. [Why this exists and what we are testing](docs/00-rationale.md)
+2. [Why this exists, the paper, and what we test](docs/00-rationale.md)
 3. [Architecture and experiment design](docs/01-design.md)
-4. [Concrete implementation plan](docs/02-implementation-plan.md)
+4. [Phased implementation plan](docs/02-implementation-plan.md)
 5. [Research and investigation references](docs/03-research-references.md)
 
-After moving to WebHMF, create `docs/04-webhmf-environment.md` from observed workstation facts before implementing real worker adapters.
+Created during Phase 0 on WebHMF, before any runtime code:
 
-## Intended control loop
+6. `docs/04-webhmf-environment.md`: observed workstation facts
+7. `docs/05-experiment-protocol.md`: task corpus, arms, repeats, metrics
+
+## Control loop: an escalation ladder
 
 ```text
 task
-  -> Jev routing signals
-  -> deterministic route
-       DIRECT
-       SUPERVISED
-       BREADTH (max two candidates)
-  -> Codex / OpenCode / Pi worker(s)
-  -> evidence / verification
-  -> Jev supervision signals where useful
-  -> deterministic continue / verify / steer / retry / repair / escalate / finish
-  -> inspectable run report
+  -> L0 DIRECT     one worker -> verify ---------------------------> pass: finish
+  -> L1 REFINE     critique -> correct -> verify, up to D rounds
+                   checkpoint every round, never accept a regression -> pass: finish
+  -> L2 BREADTH    one deliberately different candidate in an isolated
+                   workspace, which also gets refinement
+                   -> select by verifier; reviewer compares only on a tie
+  -> best verified state + inspectable run report
 ```
+
+Escalation is driven by evidence: a failing verifier, a stuck worker, or a stalled refinement loop. Predicting difficulty upfront is an optional experiment arm, not the default.
 
 ## Architectural rule
 
-> Jev decides bounded questions. Workers do coding. Reviewers do deep semantic critique. Tools verify objective claims. Deterministic code owns control flow.
+> Jev answers bounded questions. Workers write code. Critics find concrete defects. Verifiers decide correctness. Deterministic code owns control flow.
 
 ## Source inspirations
 
 This experiment borrows ideas, not entire control planes, from:
 
+- [Refining Over Resampling (arXiv 2608.05643)](https://arxiv.org/abs/2608.05643)
 - [JevRouter](https://github.com/BillionsBobby/JevRouter)
 - [Foreman](https://github.com/thruwire/foreman)
 - [Claudexor](https://github.com/razzant/claudexor)
@@ -60,4 +67,4 @@ This experiment borrows ideas, not entire control planes, from:
 - [awesome-agent-orchestrators](https://github.com/andyrewlee/awesome-agent-orchestrators)
 - [awesome-jev](https://github.com/cobanov/awesome-jev)
 
-See `docs/03-research-references.md` for the canonical URLs, primary-source research links, worker documentation, and the exact questions a future model should investigate before changing the design.
+See `docs/03-research-references.md` for canonical URLs, worker documentation, and open questions.

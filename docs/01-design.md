@@ -2,735 +2,427 @@
 
 ## 1. Design objective
 
-Build the smallest orchestration control plane that can answer this practical question:
+Build the smallest orchestration control plane that can answer:
 
-> Can Jev-gated routing plus evidence-driven supervision and selective two-candidate breadth produce better coding outcomes than a single coding agent, without turning every task into an expensive multi-agent workflow?
+> For frontier coding agents, does verifier-gated refinement, with selective two-candidate breadth only after refinement stalls, beat a single run and compute-matched resampling, and does Jev control it better than simple rules?
 
-The system is intentionally **not** a general autonomous-agent platform. It is an experiment runner with a clean path toward becoming a reusable local orchestrator if the experiment succeeds.
+The system is an **experiment runner** first. It has a clean path to becoming a reusable local orchestrator only if the experiment justifies that.
 
 ## 2. Design constraints
 
-The first implementation must preserve these constraints:
+- Codex, OpenCode, Pi, and Claude Code are interchangeable workers behind one contract; none is required.
+- Worker harness choice is separate from underlying model choice.
+- Jev may score or recommend; it may not execute side effects.
+- Deterministic policy owns budgets, round limits, process control, workspace isolation, checkpoints, and stop conditions.
+- Objective verification outranks critic and reviewer opinion.
+- Depth (refinement) comes before breadth (a second candidate).
+- Refinement never accepts a verification regression.
+- Breadth is at most two candidates, deliberately different.
+- No MCTS, large Best-of-N, learned reward models, or debate.
+- Every escalation is inspectable after the run.
+- Every mechanism has a compute-matched comparison arm.
+- The control plane is portable from WebHarness ARM to the WebHMF workstation.
 
-- Prefer Codex, OpenCode, and Pi Agent as worker harnesses.
-- Do not make Claude Code a required dependency.
-- Keep worker harness choice separate from underlying model choice.
-- Jev may recommend or score decisions but may not directly execute side effects.
-- Deterministic policy owns budgets, retries, process control, workspace isolation, and stop conditions.
-- Objective verification outranks model review.
-- Default to one worker; use a second candidate only for named hard-mode reasons.
-- Permit at most one repair pass in the first experiment.
-- Avoid MCTS, large Best-of-N sampling, learned reward models, and unbounded debate.
-- Keep every routing/escalation decision inspectable after a run.
-- Make the control plane portable from WebHarness ARM to the actual WebHMF workstation.
+## 3. Technology shape
 
-## 3. Proposed technology shape
+**TypeScript on Node.js**, as a small local CLI.
 
-The preferred implementation language is **TypeScript on Node.js**.
-
-Reasons:
-
-- Pi exposes an embeddable TypeScript-friendly surface.
-- Codex and OpenCode can be wrapped as subprocess or structured-service adapters.
-- TypeScript makes typed bounded decisions and event schemas straightforward.
-- The system can remain a small local CLI/service without introducing a heavyweight workflow engine.
-- Worker invocation details can stay behind interfaces, allowing target-workstation discovery to determine the exact adapter implementation.
-
-The design does **not** require a specific Jev SDK. Jev access is behind a `DecisionProvider` interface and can use an official SDK or direct API client available on the target workstation.
+- Pi exposes a TypeScript SDK; Claude Code has a TypeScript Agent SDK; Codex and OpenCode expose structured process/server interfaces.
+- Typed decision and event schemas are straightforward.
+- No workflow engine. Node built-ins handle subprocesses and CLI parsing; `node:test` handles unit tests.
+- Jev access sits behind a `DecisionProvider` interface, so no specific SDK is required.
 
 ## 4. System overview
 
 ```text
-                            USER TASK
-                                |
-                                v
-                    +-----------------------+
-                    |   Task Normalizer     |
-                    +-----------+-----------+
-                                |
-                                v
-                    +-----------------------+
-                    | Jev Routing Signals   |
-                    | difficulty            |
-                    | breadth value         |
-                    | verification value    |
-                    | uncertainty / risk     |
-                    +-----------+-----------+
-                                |
-                                v
-                    +-----------------------+
-                    | Deterministic Router  |
-                    +-----------+-----------+
-                                |
-              +-----------------+------------------+
-              |                 |                  |
-              v                 v                  v
-           DIRECT           SUPERVISED          BREADTH
-        one worker          one worker          two isolated
-        minimal loop        + supervision       candidates
-              |                 |                  |
-              +-----------------+------------------+
-                                |
-                                v
-                    +-----------------------+
-                    | Verification / Review |
-                    +-----------+-----------+
-                                |
-                                v
-                    +-----------------------+
-                    | Deterministic Arbiter |
-                    +-----------+-----------+
-                                |
-                                v
-                           FINAL RESULT
+                         CORPUS TASK / USER TASK
+                                   |
+                                   v
+                        +---------------------+
+                        |   Task Normalizer   |  -> TaskEnvelope (+ verifier spec)
+                        +----------+----------+
+                                   |
+                                   v
+                        +---------------------+
+                        | Verifier Preparation|  existing checks, or held-out
+                        +----------+----------+  acceptance checks (§6.5)
+                                   |
+                                   v
+     +-----------------------------------------------------------+
+     |  DETERMINISTIC ARBITER (policy, budgets, legal actions)   |
+     |                                                           |
+     |   L0 DIRECT ---fail/stuck---> L1 REFINE ---stall---> L2 BREADTH
+     |      |                         |  critic -> correct      |  2nd diverse
+     |      |                         |  -> verify -> keep best |  candidate,
+     |      |                         |  checkpoint             |  also refined
+     |      v                         v                         v
+     |   Worker adapters (Codex / OpenCode / Pi / Claude Code)   |
+     |   Critic   Verifier   Checkpoint store   Reviewer (tie)   |
+     |                                                           |
+     |   Decision signals: RulesProvider | JevProvider           |
+     +---------------------------+-------------------------------+
+                                 |
+                                 v
+                 append-only event log -> run report
 ```
 
-## 5. Three execution tiers
+## 5. The escalation ladder
 
-### 5.1 DIRECT
-
-Purpose: avoid orchestration overhead for straightforward tasks.
-
-Flow:
+### 5.1 L0 DIRECT
 
 ```text
-normalize
-  -> select one worker configuration
-  -> run
-  -> collect final artifact/evidence
-  -> perform only required deterministic verification
-  -> finish
+start worker -> stream events -> (supervision checkpoints) -> worker claims completion
+  -> verify -> pass: FINISH
+            -> fail/partial: ESCALATE to L1
 ```
 
-No continuous semantic supervision is required unless a hard failure occurs.
+Supervision during L0 is coarse. It reacts to a command failing repeatedly, no diff change for a configured interval, or the worker asking a question, and it can STOP a stuck worker early. Every task starts here unless an experiment arm says otherwise.
 
-Typical reasons:
+### 5.2 L1 REFINE (depth)
 
-- low ambiguity,
-- low failure consequence,
-- short task,
-- obvious worker fit,
-- deterministic verification available.
-
-### 5.2 SUPERVISED
-
-Purpose: improve difficult single-worker execution without paying for a second full candidate.
-
-Flow:
+This is the paper's *critique → correct* loop, made verifier-gated.
 
 ```text
-normalize
-  -> choose primary worker
-  -> run to observation checkpoint
-  -> collect evidence
-  -> Jev supervision signals
-  -> deterministic action
-       CONTINUE
-       VERIFY
-       STEER
-       RETRY
-       ESCALATE
-       FINISH
-  -> repeat within budget
+for round in 1..D:
+    critique  = Critic(task, diff vs base, verifier output, previous critiques)
+    if critique.noConcreteDefect: STOP (stalled)
+    correct   = same worker session, given critique + verifier output
+    score     = Verify(candidate)
+    if score > best: checkpoint(candidate); best = score
+    elif score == best: keep the candidate; count as no-progress
+    else: revert to best checkpoint; count as regression
+    if pass: FINISH
+    if no-progress or regression twice in a row: STOP (stalled)
+-> stalled: ESCALATE to L2 if allowed, else FINISH with best verified state
 ```
 
-The supervisor should operate at **coarse checkpoints**, not after every token or tool call. Examples:
+Defaults: `D = 2`, hard maximum `3`.
 
-- worker asks for a decision,
-- command fails,
-- verification finishes,
-- diff changes materially,
-- worker reports completion,
-- no progress occurs within a configured interval,
-- or the runtime receives a structured worker event worth evaluating.
+Key properties:
 
-### 5.3 BREADTH
+- **Explicit critique.** Corrections are driven by named defects, not by "try again". The paper's ablation shows critique matters.
+- **Cross-family critic** where available (the critic uses a different model family than the worker). If none is available, the critic falls back to the same family, and the report says so.
+- **Same-session correction.** The worker keeps its context. If the harness cannot resume a session, it gets a fresh session on the checkpointed workspace plus the critique, and the report records this.
+- **Monotonic acceptance.** The workspace never ends worse than the best verified checkpoint.
 
-Purpose: spend extra compute only when independent approaches are likely to improve reliability.
-
-Initial design:
+### 5.3 L2 BREADTH
 
 ```text
-task
-  -> isolate workspace A
-  -> isolate workspace B
-  -> candidate A using worker configuration A
-  -> candidate B using worker configuration B
-  -> run deterministic verification on both where possible
-  -> compare evidence
-  -> reviewer challenges both
-  -> deterministic arbiter selects:
-       accept A
-       accept B
-       repair A once
-       repair B once
-       unresolved
-  -> verify repaired winner
-  -> finish
+create isolated workspace B from the base revision
+start candidate B with a deliberately different configuration
+  (different harness or model family; optionally a different strategy instruction)
+  -- B does NOT see A's diff (independence) --
+B gets its own L0 -> L1 (D_B <= 2)
+select:
+  one candidate passes, the other fails      -> pick the passing one
+  scores differ                              -> pick the higher score
+  tie (both pass or equal partial scores)    -> one Reviewer comparison
+  still unresolved                           -> report "unresolved" + both artifacts
 ```
 
-The first experiment uses **two candidates only**.
+The design deliberately allows **one** second candidate. Candidate A's best checkpoint is never discarded.
 
-Candidate diversity should be intentional. Examples:
+### 5.4 Optional predictive entry (experiment arm E only)
 
-- Codex vs OpenCode,
-- Codex vs Pi with a different underlying model,
-- same harness with meaningfully different model families,
-- direct implementation vs edge-case/invariant-first instruction.
+Jev routing signals can be computed from the task envelope, letting the run start directly at L1 (with a critic pass after the first attempt) or start A and B concurrently. This trades cost for wall-clock time. It is not the default, because the cascade only spends breadth after evidence says it is needed.
 
-Breadth mode must not simply run the same prompt twice against identical configuration unless the experiment is explicitly measuring resampling.
-
-## 6. Responsibility boundaries
+## 6. Components
 
 ### 6.1 TaskNormalizer
 
-Consumes:
+Turns the raw task plus repository context into a typed `TaskEnvelope`: task text, repository path, base revision, explicit constraints, verifier spec, and category (for corpus runs). It does not choose a worker.
 
-- raw user task,
-- repository/workspace context,
-- explicit user constraints,
-- available worker capabilities.
-
-Produces a typed `TaskEnvelope` containing only information needed for routing and execution.
-
-It does not choose a worker.
-
-### 6.2 DecisionProvider
-
-Represents Jev-backed bounded decisions.
-
-Candidate routing signals:
-
-```ts
-type RoutingSignals = {
-  difficulty: 0 | 1 | 2 | 3 | 4;
-  breadthValue: number;          // 0..1
-  verificationValue: number;     // 0..1
-  ambiguity: number;             // 0..1
-  consequence: "low" | "medium" | "high";
-  preferredCapabilityIds: string[];
-};
-```
-
-Candidate supervision signals:
-
-```ts
-type SupervisionSignals = {
-  appearsStuck: number;          // 0..1
-  progressQuality: number;       // 0..1
-  needsVerification: number;     // 0..1
-  localRepairLikely: number;     // 0..1
-  escalationUseful: number;      // 0..1
-  completionPlausible: number;   // 0..1
-};
-```
-
-These are **signals**, not actions.
-
-### 6.3 Deterministic Router
-
-Maps routing signals plus configuration and availability to one of:
-
-```text
-DIRECT
-SUPERVISED
-BREADTH
-```
-
-Example policy shape:
-
-```text
-if explicit mode override:
-    use override
-
-else if high consequence:
-    at least SUPERVISED
-
-else if breadthValue >= breadth threshold
-        and second worker is available
-        and budget permits:
-    BREADTH
-
-else if difficulty >= supervision threshold:
-    SUPERVISED
-
-else:
-    DIRECT
-```
-
-Thresholds belong in configuration and are recorded in the run.
-
-### 6.4 WorkerAdapter
-
-All coding harnesses implement one conceptual contract.
+### 6.2 WorkerAdapter
 
 ```ts
 interface WorkerAdapter {
   id: string;
-  capabilities(): Promise<WorkerCapabilities>;
+  capabilities(): Promise<WorkerCapabilities>; // steering, resume, events, usage, subagent control
   start(input: WorkerStartInput): Promise<WorkerHandle>;
-  observe(handle: WorkerHandle): Promise<WorkerObservation>;
-  steer?(handle: WorkerHandle, instruction: string): Promise<void>;
-  terminate(handle: WorkerHandle): Promise<void>;
+  events(handle: WorkerHandle): AsyncIterable<WorkerEvent>; // all target harnesses stream
+  send?(handle: WorkerHandle, message: string): Promise<void>; // follow-up turn in same session (correction)
+  steer?(handle: WorkerHandle, instruction: string): Promise<void>; // mid-turn steering
+  terminate(handle: WorkerHandle): Promise<WorkerResult>;
 }
 ```
 
-The exact implementation can vary:
+Candidate integration surfaces, to be **confirmed on WebHMF**, not assumed:
 
-- Codex App Server or structured Codex process,
-- Codex exec fallback,
-- OpenCode process/API,
-- Pi RPC/SDK process.
+- Codex: App Server (threads/turns, steering) or `codex exec --json` plus resume,
+- OpenCode: server API, ACP, or `opencode run --format json`,
+- Pi: RPC or SDK,
+- Claude Code: Agent SDK or `claude -p --output-format stream-json` plus `--resume`.
 
-Live steering is optional. If unavailable, deterministic policy converts a steering need into a stop-and-retry action when allowed.
+If an adapter cannot `send`, correction uses a fresh session on the checkpoint. If it cannot `steer`, steering becomes stop-and-continue.
 
-### 6.5 VerificationAdapter
+**Nested subagents.** Harnesses can spawn their own subagents, which hides cost and activity from the orchestrator's budget. During experiment runs, adapters disable them where the harness allows. Otherwise they count observed subagent usage as worker usage, and the report flags "nested subagents active".
 
-Verification is intentionally independent of worker identity.
+### 6.3 Critic
 
 ```ts
-interface VerificationAdapter {
-  id: string;
-  supports(context: VerificationContext): Promise<boolean>;
-  run(context: VerificationContext): Promise<VerificationResult>;
-}
+type Critique = {
+  noConcreteDefect: boolean;
+  defects: Array<{
+    location: string;                     // file/function/test
+    description: string;
+    evidence: "verifier" | "diff" | "both";
+    localized: boolean;                   // repairable in place vs needs a new approach
+  }>;
+  approachSound: boolean;                 // false suggests breadth over more depth
+};
 ```
 
-Examples:
+The critic is a frontier model, either a configured worker in read-only mode or a direct API call. It sees the reviewer projection (§8). Output is schema-validated; unparseable output counts as `noConcreteDefect` with an error event, and never triggers an action on its own.
 
-- repository command,
-- compiler,
-- type checker,
-- structured diff check,
-- task-specific executable check.
+### 6.4 DecisionProvider: rules vs Jev
 
-The first implementation should not invent validation commands. It should discover or accept explicitly configured verification for the target repository.
+One interface with two implementations, so the experiment can isolate Jev's contribution.
 
-### 6.6 Reviewer
+```ts
+type SupervisionSignals = {
+  appearsStuck: number;          // 0..1, during a worker run
+  completionPlausible: number;   // 0..1, used only when no verifier exists
+};
 
-A reviewer is a strong generative model/agent role used only when semantic critique is required.
+type RefinementSignals = {
+  repairLikely: number;          // 0..1, given the critique: will in-place correction work?
+};
 
-Responsibilities:
+type RoutingSignals = {          // arm E only
+  difficulty: 0 | 1 | 2 | 3 | 4;
+  breadthValue: number;          // 0..1
+};
+```
 
-- compare candidate assumptions,
-- find concrete logic/implementation flaws,
-- identify missing edge cases,
-- recommend keep/repair/reject,
-- and localize the smallest repair.
+- **RulesProvider** derives signals deterministically. Examples: the same failing command at least twice means stuck; no workspace change for T minutes means stuck; a critique with any non-localized defect, or `approachSound=false`, makes repair unlikely.
+- **JevProvider** asks Jev the same bounded questions over the compact projection.
 
-The reviewer does not override deterministic verification.
+v0 deliberately keeps **few signals**. Each one is a threshold to tune, and a small corpus cannot support many thresholds without overfitting. Add signals only when run reports show a decision the current ones cannot make.
 
-A reviewer may use Codex, OpenCode, Pi, or another configured frontier worker. The architecture does not permanently bind this role to a vendor.
+### 6.5 Verification
 
-### 6.7 Deterministic Arbiter
+```ts
+type VerificationResult = {
+  status: "pass" | "fail" | "partial" | "unknown" | "error";
+  score?: { passed: number; total: number };     // enables progress measurement
+  output: BoundedText; artifactPath?: string;
+  source: "repository" | "task" | "held-out-acceptance";
+};
+```
 
-The arbiter owns legal state transitions.
+Verifier sources, in order of preference:
 
-Possible actions:
+1. **Task-specified checks:** corpus tasks carry their own (for example, the fix commit's tests).
+2. **Repository checks:** test/lint/typecheck commands from configuration or authoritative repository instructions. The orchestrator never invents them.
+3. **Held-out acceptance checks:** when 1 and 2 are missing or do not cover the task, a different worker writes acceptance tests from the task text before implementation starts. The checks are stored outside the candidate workspace, so the implementer cannot see or edit them, and are copied in only at verify time. They are valid only if they **fail on the base revision** and run cleanly. Invalid checks are discarded and the run continues as `unknown`.
+4. **None:** status `unknown`. This is never success. Completion then depends on configured policy (critic plus `completionPlausible`) and is reported as **unverified**.
+
+### 6.6 Checkpoint store
+
+Each candidate workspace is a Git worktree. Every refinement round that is accepted becomes a commit on the candidate branch, tagged with its verification score. Revert means resetting to the best checkpoint commit. Checkpoints are never deleted during a run, so the full refinement trajectory stays inspectable.
+
+### 6.7 Reviewer
+
+A reviewer is used **only** for an L2 tie. It compares the two candidates' diffs and evidence and returns a structured preference with reasons, or "no preference". It never overrides verification. A remaining tie is reported as `unresolved`.
+
+### 6.8 Deterministic Arbiter
 
 ```ts
 type RuntimeAction =
-  | "CONTINUE"
-  | "VERIFY"
-  | "STEER"
-  | "RETRY"
-  | "ESCALATE"
-  | "START_SECOND_CANDIDATE"
-  | "REVIEW"
-  | "REPAIR"
-  | "FINISH"
-  | "FAIL";
+  | "CONTINUE" | "STOP_WORKER" | "VERIFY"
+  | "CRITIQUE" | "CORRECT" | "ACCEPT_CHECKPOINT" | "REVERT_CHECKPOINT"
+  | "START_SECOND_CANDIDATE" | "REVIEW"
+  | "FINISH" | "FAIL";
 ```
 
-The arbiter consumes:
-
-- current run state,
-- budget,
-- worker availability,
-- Jev signals,
-- verification results,
-- reviewer findings,
-- retry/repair counters,
-- user policy.
-
-It produces one legal action and a machine-readable reason.
+A pure function `(RunState, signals, evidence, budget, config) -> { action, reason }`. It returns exactly one legal action with a machine-readable reason. Illegal transitions are errors, never silent fallbacks. It is unit tested.
 
 ## 7. Event-sourced run history
 
-Every meaningful observation and decision should be recorded as an append-only event.
-
-Conceptual event examples:
+Every observation and decision is an append-only JSONL event: run ID, sequence number, timestamp, type, source, typed payload, and candidate ID.
 
 ```text
-run.started
-routing.signals_received
-routing.decision_made
-worker.started
-worker.observation
-verification.started
-verification.completed
-supervision.signals_received
-arbiter.action_selected
-worker.steered
-worker.retried
-breadth.candidate_started
-review.completed
-repair.started
-run.finished
-run.failed
+run.started            config.snapshot          verifier.prepared
+worker.started         worker.event             worker.finished
+verification.completed critique.completed       decision.signals
+arbiter.action         checkpoint.accepted      checkpoint.reverted
+candidate.started      review.completed         run.finished / run.failed
 ```
 
-Each event contains:
+`RunState` is reconstructed by folding events (unit tested). The report answers questions like "why was a second candidate started?" from recorded evidence, signals, thresholds, and budget.
 
-- run ID,
-- sequence number,
-- timestamp,
-- event type,
-- source,
-- relevant typed payload,
-- optional parent/candidate ID.
+## 8. Projections
 
-The event history is the source for post-run explanation:
-
-> Why did the system call a second worker?
-
-The answer should be reconstructable from recorded routing signals, thresholds, availability, budget, and arbiter decision.
-
-## 8. State projections
-
-Borrowing the strongest idea from JevLoop, different consumers should receive different projections from the same run history.
-
-### Jev projection
-
-Small, bounded, structured, and stripped of unnecessary prose.
-
-Examples:
-
-- task category,
-- latest worker status,
-- verification status,
-- changed-file count,
-- recent failure summary,
-- retry count,
-- elapsed/budget fraction.
-
-### Reviewer projection
-
-Richer semantic context:
-
-- original task,
-- candidate answer/diff,
-- relevant execution output,
-- verification failures,
-- explicit constraints.
-
-### Runtime projection
-
-Authoritative machine state:
-
-- active processes,
-- workspace locations,
-- budgets,
-- candidate IDs,
-- counters,
-- allowed next actions.
+- **Decision projection (Jev/rules):** compact facts only: level, round, last verifier score and trend, failing-check count, changed-file count, last error summary, elapsed/budget fraction, critique summary flags.
+- **Critic/reviewer projection:** task, constraints, diff against base, verifier output (bounded), previous critiques in this run.
+- **Runtime projection:** processes, workspaces, checkpoints, counters, budget, legal next actions.
 
 No model owns runtime truth.
 
-## 9. Budgets
+## 9. Budgets and compute accounting
 
-The first implementation should use simple hard budgets.
+Hard per-run limits: wall-clock, worker sessions, correction rounds per candidate (D), candidates (≤2), critic calls, reviewer calls (≤1), Jev calls.
 
-Per run:
+Compute is accounted **per call** in whatever unit the harness reports: input/output tokens, provider cost, or subscription quota. Wall-clock is always recorded. Subscription logins often report no dollar cost, so arms are compared on tokens and wall-clock, with dollars only where available. **Compute matching** between arms (§15) uses the same unit.
 
-- maximum wall-clock duration,
-- maximum worker invocations,
-- maximum Jev decisions,
-- maximum reviewer calls,
-- maximum retries,
-- maximum repair passes,
-- maximum concurrent candidates.
-
-Initial experimental defaults should favor simplicity:
+Default limits:
 
 ```text
-candidates:      max 2
-repair passes:   max 1
-retry passes:    max 1 per candidate
-review rounds:   max 1 before repair
+candidates:          max 2
+refinement rounds:   D = 2 per candidate (hard max 3)
+critic calls:        <= D per candidate
+reviewer calls:      max 1 (L2 tie only)
 ```
-
-Exact numeric time/token/cost thresholds should be configurable rather than hard-coded in the architecture document.
 
 ## 10. Stop conditions
 
-A run should stop when any of these deterministic conditions is reached:
+- **Verified success:** the verifier passes.
+- **Unverified completion:** no verifier exists and the configured completion policy is satisfied. Reported as unverified.
+- **Stalled:** refinement stalled and breadth is not allowed or already used. Return the best verified state.
+- **Budget stop:** any hard limit reached. Return the best verified state.
+- **Policy stop:** user cancellation, forbidden action, unavailable capability, unrecoverable worker failure.
+- **Unresolved:** L2 tie the reviewer could not break.
 
-### Successful stop
+The runtime never labels a non-passing state as success.
 
-- required deterministic verification passes, or
-- no deterministic verifier exists and the configured completion policy is satisfied after review.
+## 11. Breadth selection rules
 
-### Budget stop
+- Candidate B must differ from A in at least one recorded dimension: harness, model family, or strategy instruction. Same harness plus same model plus a different temperature is rejected by config validation, unless the run is arm R.
+- B is independent: it does not see A's diff or critiques. Feeding A's failure into B is a different strategy ("informed restart") and would need its own arm.
+- Selection is by verifier first. The reviewer is consulted only on ties.
 
-- wall-clock budget exceeded,
-- worker-call budget exceeded,
-- reviewer budget exceeded,
-- or allowed retry/repair count exhausted.
-
-### Policy stop
-
-- user cancellation,
-- forbidden action,
-- unavailable required capability,
-- unrecoverable worker failure.
-
-The runtime should return the **best verified state reached**, not silently pretend full success after a budget stop.
-
-## 11. Local repair policy
-
-Repair is preferred when:
-
-- verification exposes a localized failure,
-- reviewer identifies a specific defect,
-- the rest of the candidate remains sound,
-- and repair budget remains.
-
-Repair is rejected when:
-
-- the approach is fundamentally incompatible with the task,
-- the candidate violates major architectural constraints,
-- the worker has not produced a coherent state worth preserving,
-- or a previous repair already failed.
-
-The first experiment permits one repair pass.
-
-## 12. Worker selection strategy
-
-Worker identities are capabilities, not permanent cognitive roles.
-
-Example registry:
+## 12. Worker registry
 
 ```ts
 type WorkerDescriptor = {
   id: string;
-  harness: "codex" | "opencode" | "pi" | string;
+  harness: "codex" | "opencode" | "pi" | "claude-code" | string;
   model?: string;
-  supportsSteering: boolean;
-  supportsStructuredEvents: boolean;
+  modelFamily?: string;           // used for cross-family critic and diversity checks
   costClass: "cheap" | "standard" | "frontier";
+  roles: Array<"worker" | "critic" | "reviewer" | "test-author">;
   tags: string[];
 };
 ```
 
-Possible registered configurations:
+Roles are configuration, not brand identity. The same harness may appear several times with different models.
 
-```text
-codex-primary
-opencode-independent
-pi-cheap-workhorse
-pi-frontier-reviewer
-```
+## 13. Failure and fallback
 
-The same Pi harness may appear multiple times with different underlying models.
-
-## 13. Failure and fallback behavior
-
-### Jev unavailable
-
-Fallback to deterministic conservative routing:
-
-- straightforward explicit tasks -> DIRECT,
-- otherwise -> SUPERVISED,
-- never enter BREADTH automatically without a decision signal or explicit override.
-
-### Primary worker unavailable
-
-Choose the next compatible worker descriptor according to deterministic availability policy.
-
-### Reviewer unavailable
-
-Do not synthesize fake consensus. Use verification evidence and mark unresolved semantic disagreement explicitly.
-
-### Verification unavailable
-
-Record that no objective verifier was available. High-consequence tasks may require reviewer escalation or return an unresolved status depending on policy.
+- **Jev unavailable:** use RulesProvider and record the fallback.
+- **Critic unavailable:** refinement uses verifier output only, and the report flags "critic-less refinement".
+- **Worker unavailable:** use the next compatible descriptor by deterministic availability policy.
+- **Reviewer unavailable:** an L2 tie becomes `unresolved`; never fake consensus.
+- **Verifier unavailable:** status `unknown`, reported as unverified.
 
 ## 14. Configuration
 
-Configuration should be declarative and environment-neutral.
-
-Conceptual sections:
+Declarative and environment-neutral; secrets come only from environment references.
 
 ```yaml
-routing:
-  supervisionDifficultyThreshold: 2
-  breadthValueThreshold: 0.75
-
+ladder:
+  refineRounds: 2              # D, hard max 3
+  stallAfterNoProgress: 2
+  breadthEnabled: true
+decisions:
+  provider: rules              # rules | jev
+  stuckThreshold: 0.7
+  repairLikelyThreshold: 0.5
 budgets:
   maxCandidates: 2
-  maxRetriesPerCandidate: 1
-  maxRepairsPerRun: 1
+  maxWallClockMinutes: 60
   maxReviewerCalls: 1
-
 workers:
-  - id: codex-primary
-    adapter: codex
-  - id: opencode-independent
-    adapter: opencode
-  - id: pi-workhorse
-    adapter: pi
-
+  - { id: codex-primary,  harness: codex,       modelFamily: openai,    roles: [worker] }
+  - { id: claude-critic,  harness: claude-code, modelFamily: anthropic, roles: [critic, reviewer] }
+  - { id: pi-alt,         harness: pi,          modelFamily: other,     roles: [worker, test-author] }
+  - { id: opencode-alt,   harness: opencode,    roles: [worker] }
 verification:
-  discovery: repository
+  sources: [task, repository, held-out-acceptance]
+experiment:
+  disableNestedSubagents: true
 ```
 
-Secrets, tokens, provider credentials, and machine-specific auth state are never written into this file.
+## 15. Experiment arms
 
-## 15. Experiment modes
+Every arm shares the same adapters, verifier, and event log. Only the policy differs.
 
-The runner should make comparison explicit.
+| Arm | Policy | Isolates |
+|---|---|---|
+| **A** | single worker, verify once | baseline |
+| **R** | two independent runs (same configuration), verifier picks | resampling at matched compute |
+| **R'** | two runs with *different* configurations, verifier picks | diversity without refinement |
+| **B** | L0 → L1 with RulesProvider | refinement (H1 vs R, H2 vs A) |
+| **B0** | B without the critic (verifier output only) | value of explicit critique (H3) |
+| **C** | B with JevProvider | Jev vs rules (H4) |
+| **D** | full ladder L0 → L1 → L2 (provider = winner of B vs C) | breadth after stall (H5, H6 vs R') |
+| **E** *(optional)* | Jev predictive entry | prediction vs cascade |
 
-### Baseline A — Single worker
-
-```text
-task -> one worker -> verification -> result
-```
-
-### Baseline B — Supervised single worker
-
-```text
-task -> worker -> Jev/evidence supervision -> repair/retry if justified -> verification
-```
-
-### Experiment C — Adaptive policy
-
-```text
-task -> Jev routing -> DIRECT / SUPERVISED / BREADTH
-```
-
-This allows us to ask whether complexity in the controller produces measurable benefit.
+**Compute matching:** R and R' are budgeted to B's median compute on the same task set, so "refinement beats resampling" is a fair claim.
 
 ## 16. What to measure
 
-Each run should emit enough metadata to compare:
+Per run: arm, final status (verified / unverified / stalled / budget / unresolved), verifier score trajectory, levels reached, rounds used, regressions reverted, candidates, critic/reviewer/Jev calls, tokens/cost/quota per call, wall-clock, harness and model versions, nested-subagent flag, and the arbiter's reason for every transition.
 
-- final status,
-- verification status,
-- worker configuration(s),
-- number of worker invocations,
-- number of Jev decisions,
-- number of reviewer calls,
-- retry count,
-- repair count,
-- escalation count,
-- elapsed time,
-- available token/cost metadata when providers expose it,
-- and the deterministic reason for every action transition.
+Per arm across the corpus: verified success rate with confidence intervals over the k repeats, cost distribution, and **paired** per-task comparisons against A and R. Recovery rate is also tracked: of tasks that failed L0, the share recovered at L1 and at L2. That is the coding analogue of the paper's per-depth recovery rate.
 
-The experiment should not depend on provider-reported “confidence.”
+The experiment never relies on provider-reported "confidence".
 
 ## 17. Repository layout target
 
-Planned structure:
-
 ```text
-jev-ttc-orchestrator-experiment/
-  README.md
-  docs/
-    00-rationale.md
-    01-design.md
-    02-implementation-plan.md
-  src/
-    cli/
-    core/
-      events.ts
-      state.ts
-      policy.ts
-      budgets.ts
-    decisions/
-      provider.ts
-      jev.ts
-      schemas.ts
-    routing/
-      router.ts
-    supervisor/
-      supervisor.ts
-    workers/
-      adapter.ts
-      registry.ts
-      codex.ts
-      opencode.ts
-      pi.ts
-    verification/
-      adapter.ts
-      registry.ts
-    review/
-      reviewer.ts
-    runtime/
-      orchestrator.ts
-      workspace.ts
-      event-store.ts
-    reporting/
-      run-report.ts
-  config/
-    example.yaml
+src/
+  cli/main.ts
+  core/        types.ts events.ts state.ts policy.ts budgets.ts errors.ts
+  config/      schema.ts load.ts
+  decisions/   provider.ts rules.ts jev.ts schemas.ts
+  workers/     adapter.ts registry.ts process.ts codex.ts opencode.ts pi.ts claude-code.ts
+  critic/      critic.ts
+  review/      reviewer.ts
+  verification/ adapter.ts command.ts acceptance.ts
+  runtime/     orchestrator.ts workspace.ts checkpoints.ts event-store.ts
+  experiment/  corpus.ts arms.ts runner.ts
+  reporting/   run-report.ts compare.ts
+test/          (unit tests for pure core)
+corpus/        (task manifests; no secrets, no private repos' contents)
+config/example.yaml
 ```
 
-This layout is a design target, not yet implemented.
+This is a design target; nothing is implemented yet.
 
-## 18. WebHarness ARM -> WebHMF workstation handoff
+## 18. WebHarness ARM → WebHMF handoff
 
-This phase creates the specification and implementation plan on WebHarness ARM.
-
-The next environment phase should occur on the actual WebHMF workstation and begin with **discovery, not assumptions**:
-
-1. inspect installed Codex interfaces and versions,
-2. inspect OpenCode interfaces and versions,
-3. inspect Pi installation/API/RPC availability,
-4. inspect Jev credentials/client availability,
-5. identify local repository/workspace conventions,
-6. identify how each harness exposes structured events and cancellation,
-7. choose the narrowest adapter for each worker,
-8. populate local, untracked configuration.
-
-The repository should be transferred through normal Git clone/push/pull or another explicit copy mechanism chosen at that time.
-
-No machine credentials, auth caches, or workstation-specific secrets should be copied from ARM.
+Implementation begins on WebHMF with **discovery, not assumptions**: inspect each harness's version, structured interface, session resume, steering, cancellation, usage reporting, subagent control, and model selection, plus Jev client/auth availability. Record the non-secret findings in `docs/04-webhmf-environment.md`. Transfer the repository through Git. Never copy credentials or auth caches from ARM.
 
 ## 19. Explicit non-goals for v0
 
-The first implementation will not include:
+MCTS, beam search, more than two candidates, learned PRMs, debate, autonomous long-term memory, distributed queues, multi-user hosting, web UI, plugin marketplace, credential management, and self-modifying routing policy.
 
-- MCTS,
-- beam-search reasoning trees,
-- more than two simultaneous candidate trajectories,
-- learned PRMs,
-- autonomous long-term memory,
-- distributed queues,
-- multi-user service hosting,
-- web UI,
-- arbitrary plugin marketplace,
-- automatic provider credential management,
-- or self-modifying routing policy.
-
-These can be considered only after the minimal experiment produces evidence that they are necessary.
-
-## 20. Design decision summary
-
-The proposed system combines four ideas without importing four competing orchestrators:
-
-- **JevRouter idea:** bounded capability routing.
-- **Foreman idea:** continuous evidence-driven supervision with deterministic action policy.
-- **Claudexor idea:** isolated two-candidate hard mode with review and bounded repair.
-- **JevLoop idea:** one authoritative run history with narrow projections and deterministic runtime ownership.
-
-The result is intentionally smaller than any attempt to stack all four products:
+## 20. Design summary
 
 ```text
-Jev decides bounded questions.
-Workers do coding.
-Reviewers do deep semantic critique.
-Tools verify objective claims.
-Deterministic code owns control flow.
+Paper:  breadth saturates; explicit critique + correction recovers errors.
+Ours:   depth first (critique -> correct -> verify, keep best checkpoint),
+        one deliberately different second candidate only after a stall,
+        verifier instead of voting,
+        Jev vs rules measured, not assumed,
+        every mechanism compared at matched compute.
 ```
+
+## 21. Revision log
+
+### Revision 2 (2026-10-06)
+
+Reworked around arXiv 2608.05643 after a design review.
+
+- **Escalation ladder replaces upfront routing.** v1 predicted DIRECT/SUPERVISED/BREADTH from the task text. Difficulty prediction from prompts is unreliable, and the paper's lesson is to refine existing attempts first. Predictive routing is now optional arm E.
+- **Refinement is a first-class level (L1)** with explicit critique, D≤3 rounds, checkpoints, and no-regression acceptance. v1 allowed one repair, which underused the paper's main mechanism and had no guard against degradation.
+- **Breadth only after a stall**, with independence and mandatory diversity, and each candidate is also refined, as in the paper.
+- **Verifier replaces voting.** Held-out acceptance checks were added for tasks without verifiers.
+- **Experiment arms expanded:** compute-matched resampling (R, R'), a critic ablation (B0), and Jev vs rules (B vs C). v1 could not separate "the loop helps" from "Jev helps" or "refinement beats resampling".
+- **Fewer Jev signals.** Six supervision floats became two plus one refinement signal, to avoid overfitting thresholds on a small corpus.
+- **Claude Code** is now a first-class optional worker/critic adapter; it is still not required.
+- **Nested subagents** are disabled or counted during experiments.
+- **Event-streaming worker contract** (`AsyncIterable`) replaces polling `observe()`, and session continuation was added for in-session correction.
+- **Unit tests** for the pure core. v1 excluded tests entirely.
+- **Phase 0** (corpus, protocol, baseline variance) now comes before building the control plane; see `02-implementation-plan.md`.

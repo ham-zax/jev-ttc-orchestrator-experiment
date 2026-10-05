@@ -2,295 +2,193 @@
 
 ## Status
 
-Planning-only repository. No orchestration runtime has been implemented yet.
+Planning repository, revision 2. No orchestration runtime has been implemented yet.
 
 ## Why this experiment exists
 
-Modern coding agents are already strong enough to solve many tasks in one pass, but a single fixed execution policy wastes capability in two opposite ways:
+Modern coding agents can solve many tasks in one pass, but a single fixed execution policy wastes capability in two opposite ways:
 
-1. **Easy work is over-served.** A frontier model may spend expensive reasoning tokens on routing, triage, retries, and obvious decisions that could have been handled cheaply.
-2. **Hard work is under-served.** A single model can commit early to one approach, repeat the same failure mode on retries, or stop without an independent challenge or objective verification.
+1. **Easy work is over-served.** Expensive reasoning gets spent on triage, retries, and obvious decisions that could have been handled cheaply.
+2. **Hard work is under-served.** A single run can commit early to one approach, repeat the same failure on retry, or stop without an independent challenge or objective verification.
 
-Research on test-time compute suggests that additional inference compute can improve difficult-task performance when it is allocated intelligently. The practical problem is that research-grade techniques such as large Best-of-N sampling, MCTS, process reward models, and broad evaluation sweeps are too expensive and operationally complex for a normal developer workflow.
+Research on test-time compute shows that extra inference compute helps on hard tasks **when it is allocated well**. In particular, *Refining Over Resampling* (arXiv 2608.05643) shows that spending it on critique-and-correction of existing attempts beats spending it on more independent samples.
 
 This experiment asks a narrower engineering question:
 
-> Can a small, understandable orchestration layer produce meaningfully better coding-agent outcomes than a single-agent baseline by spending extra compute only when evidence says it is useful?
+> For real coding work with frontier agents, does verifier-gated refinement, with selective breadth only when refinement stalls, beat a single run and compute-matched resampling, and can cheap bounded decisions control it?
 
-The working hypothesis is that most of the practical benefit can come from a small number of mechanisms:
+The goal is **not** to reproduce an academic search engine. The goal is to find the simplest orchestration policy that is measurably better than today's single-agent default, or to show credibly that there is none.
 
-- cheap bounded routing,
-- one strong primary coding worker,
-- evidence-driven supervision,
-- selective verification,
-- one repair before restart,
-- and a two-candidate hard mode only when genuine breadth is useful.
+## What we take from the paper
 
-The goal is **not** to reproduce an academic search engine. The goal is to discover the simplest orchestration policy that is materially better than today's single-prompt / single-agent default.
+*Refining Over Resampling: Test-Time Self-Correction for LLM Reasoning* (Bilal et al., arXiv 2608.05643).
+
+**Method.** Sample N independent rollouts (N=8, τ=0.7). Refine each through D rounds (D=4) of *continuation → self-critique → self-correction*, using role-conditioned prompts on the same model. Aggregate the refined answers by plurality vote, with no external verifier.
+
+**Findings, and how this design uses each:**
+
+| Paper finding | Design consequence |
+|---|---|
+| Resampling saturates: on AIME-24, unique semantic clusters grow only from ≈1.2 at N=2 to ≈2.5 at N=32. | Breadth is capped at **2** candidates, and the second must differ *deliberately* (harness, model family, or strategy), not by temperature. |
+| Refining each rollout recovers incorrect answers across rounds. | **Depth is the first escalation.** A failing attempt is refined before anything is resampled. |
+| Removing explicit critique hurts (Qwen2.5-1.5B: AIME25 6.67% → 0.0%; MATH500 58.0% → 55.6%). | Critique is a **separate stage with structured output** (concrete defects with evidence), not folded into "try again". |
+| Self-correction is noisy for a single rollout; models can miss their own errors or make answers worse. Voting suppresses the noise. | Coding has no meaningful vote at N≤2, so the **verifier plus checkpoint revert** suppresses noise instead: a round that worsens verification is discarded. The critic should be a **different model family** where available, since self-critique misses the worker's own blind spots. |
+| No monotonic best (N, D): AMC23 reaches the same score under (5,4) and (10,4). | N and D are **configuration**, not invariants. Defaults are small and measured. |
+| Gains shrink for stronger models (≈17 points per 10³ TFLOPs for Qwen2.5-1.5B, η≈1.16 for Qwen2.5-Math-7B over RM@8). | Frontier coding agents may gain little. The experiment **must include compute-matched baselines** and accept a null result. |
+
+**What does not transfer:**
+
+- **Verifier-free aggregation.** The paper votes over closed-form math answers. Code diffs are not votable, but code usually *has* an executable verifier, which is stronger evidence than a vote. When a task has no verifier, we build held-out acceptance checks (see `01-design.md` §6.5) instead of falling back to opinion.
+- **Scale of N and D.** In the paper a "rollout" is a single generation from a small open model. Here it is a full agent session that costs minutes and real money, so v0 uses N≤2 and D≤3.
+- **Domain.** The paper evaluates math benchmarks with well-defined answers. Whether its findings hold for multi-file coding is exactly what this experiment tests.
 
 ## Core idea
 
-The experiment separates four responsibilities that are often collapsed into one LLM call:
+The experiment separates five responsibilities that are often collapsed into one LLM call.
 
-### 1. Bounded decision layer
+### 1. Coding workers
 
-Jev answers narrow questions such as:
+Mature agent harnesses do the real coding: **Codex, OpenCode, Pi, and Claude Code**, all through one adapter contract. None is an architectural dependency. The orchestrator distinguishes the **harness** from the **underlying model**; Pi, for example, can run several model families.
 
-- Which execution tier should this task use?
-- Is a second independent approach likely to help?
-- Does the current worker appear stuck?
-- Is the available evidence sufficient to verify?
-- Should the runtime continue, repair, retry, escalate, or stop?
+### 2. Critics
 
-Jev is never treated as the source of truth. It produces signals or bounded choices.
+A critic inspects a candidate's diff and verification output and returns **concrete, localized defects with evidence**, or explicitly "no concrete defect found". This is the paper's critique stage, made structured. A critic proposes defects; it does not decide correctness.
 
-### 2. Coding-agent layer
+### 3. Verification
 
-Real coding work is performed by mature agent harnesses, with an initial preference for:
+When objective evidence exists, it outranks every model opinion: compilers, type-checkers, repository test commands, task-specific executable checks. A model saying "this looks correct" is not verification. Verification produces a **score** (for example, failing checks out of total), not just pass/fail, so refinement progress is measurable.
 
-- Codex,
-- OpenCode,
-- Pi Agent.
+### 4. Bounded decisions (Jev)
 
-Claude Code may be supported later, but it is not a design dependency.
+Jev answers narrow questions cheaply: is the worker stuck, is a critic's defect localized enough to repair, is completion plausible when no verifier exists. Jev produces signals, never actions. Its value is **measured against a rules-only controller**, not assumed.
 
-The orchestrator distinguishes the **agent harness** from the **underlying model**. For example, Pi can be a worker harness while the actual model behind it is separately configurable.
+### 5. Deterministic runtime
 
-### 3. Deterministic runtime and policy layer
+Ordinary code owns allowed actions, budgets, round limits, process lifecycle, workspace isolation, checkpoints, state transitions, and stop conditions. Models propose; the runtime decides whether a proposal is allowed to happen.
 
-Ordinary code owns:
-
-- allowed actions,
-- budgets,
-- retry limits,
-- process lifecycle,
-- workspace isolation,
-- state transitions,
-- tool permissions,
-- evidence collection,
-- and final stop conditions.
-
-Models propose; the runtime decides whether a proposal is allowed to happen.
-
-### 4. Verification layer
-
-When objective evidence is available, it outranks model opinion.
-
-Examples include:
-
-- compiler/type-checker results,
-- repository-defined checks,
-- deterministic commands,
-- diff inspection,
-- structured tool outputs,
-- and other task-specific verification.
-
-A model saying “this looks correct” is not verification.
-
-## The minimal execution policy
-
-The intended first experiment is deliberately small.
-
-### Normal mode
+## The execution policy: an escalation ladder
 
 ```text
-task
-  -> Jev route / budget decision
-  -> one primary worker
-  -> collect evidence
-  -> Jev supervision signals
-  -> deterministic arbiter
-       -> continue
-       -> verify
-       -> local repair / steer
-       -> retry
-       -> escalate
-       -> finish
-  -> final result
+L0 DIRECT
+  one worker runs the task -> verify
+  pass -> finish
+
+L1 REFINE (depth; the paper's critique -> correct loop)
+  critic finds concrete defects (from diff + verifier output)
+  same worker session corrects them
+  verify; keep it only if the score is no worse than the best checkpoint
+  repeat up to D rounds (default 2, max 3)
+  stop early on pass, no improvement, or "no concrete defect"
+
+L2 BREADTH (only after refinement stalls)
+  a second, deliberately different candidate in an isolated workspace
+  it also gets up to D refinement rounds
+  select by verifier; the reviewer compares only on a tie
+  finish with the best verified state, or "unresolved"
 ```
 
-### Hard mode
-
-Only when the router decides that meaningful diversity is worth the cost:
-
-```text
-task
-  -> candidate A in isolated workspace
-  -> candidate B in isolated workspace
-  -> compare evidence and outputs
-  -> strong reviewer / critic
-  -> repair the stronger candidate when possible
-  -> deterministic verification
-  -> final result
-```
-
-The first hard-mode target is **two candidates**, not 8, 16, or 32.
+Escalation is triggered by **evidence**: a failing verifier, a stuck worker, or a stalled refinement loop. Predicting difficulty from the task text and jumping straight to L1/L2 is an optional experiment arm (E), because predicting difficulty from a prompt is unreliable and the cascade is cheaper by construction.
 
 ## Why these design choices
 
-### Why Jev for routing and supervision?
+### Why refine before resampling?
 
-The orchestration problem contains many frequent, bounded decisions. Spending a frontier-model call on every “continue?”, “stuck?”, “verify?”, or “escalate?” decision defeats the economic purpose of adaptive test-time compute.
+This is the paper's central result, and coding makes it stronger: a partially correct diff that fails one test holds a lot of valuable state. Throwing it away to resample discards the work and, per the paper's cluster analysis, often reproduces the same approach anyway.
 
-Jev is interesting here because the desired outputs are constrained decisions rather than free-form prose. Its role is therefore closer to a fast control signal than to a reasoning agent.
+### Why a verifier instead of voting?
 
-### Why not let Jev directly control processes?
+With two candidates there is no meaningful majority, and diffs are not comparable answers. Tests and compilers give better evidence than any vote. Where they are missing, we construct them before the worker starts (held-out acceptance checks written by a different worker).
 
-A probabilistic decision model should not own irreversible control flow. A deterministic arbiter should apply thresholds, budgets, permissions, and safety policy before any action is executed.
+### Why checkpoint and never accept regressions?
 
-This also makes the system easier to debug: we can inspect the signal separately from the policy that acted on it.
+The paper's limitations section notes that naive refinement can degrade answers, and single-rollout correction is noisy. A monotonic acceptance rule (keep the best verified checkpoint) makes refinement safe to try.
 
-### Why start from Foreman-like supervision?
+### Why a cross-family critic?
 
-Foreman demonstrates a useful separation:
+Models often fail to see their own errors. A critic from a different family adds new information instead of repeating the worker's blind spots. The worker still does the correction in its own session, so it keeps its context.
 
-- observe a worker,
-- derive bounded semantic checks,
-- let deterministic policy choose actions.
+### Why Jev, and why measure it against rules?
 
-It is also already aligned with the preferred worker ecosystem: Codex is a natural primary worker and OpenCode is a first-class alternative.
+The loop contains many frequent, bounded decisions. Spending a frontier call on each "stuck?" or "repair or restart?" defeats the economics of adaptive compute. But simple rules (the same command failing twice, no diff change in N minutes, the verifier score not improving) may already capture most of the signal. The experiment separates "the loop helps" from "Jev helps".
 
-The experiment will borrow this control-loop shape rather than blindly forking Foreman's entire product surface.
+### Why not let Jev control processes?
 
-### Why borrow from JevRouter?
+A probabilistic model should not own irreversible control flow. The deterministic arbiter applies thresholds, budgets, permissions, and safety policy before any action, and the signal can be inspected separately from the policy that acted on it.
 
-JevRouter provides the cleanest front-door abstraction for choosing among capabilities rather than hard-coding one model for every task.
+### What we borrow from each reference project
 
-The experiment borrows the idea that models, agents, tools, and execution strategies can be represented as candidate capabilities, while permissions and availability remain deterministic.
-
-### Why borrow from Claudexor?
-
-Claudexor is most relevant to the hard-task path:
-
-- isolated candidates,
-- independent/cross-family review,
-- bounded repair,
-- arbitration.
-
-We want that pattern, but only as an escalation mode. It should not be the default cost of every task.
-
-### Why borrow from JevLoop?
-
-JevLoop's strongest contribution is architectural discipline:
-
-- one durable event/transcript source,
-- projections for different decision makers,
-- and a deterministic runtime kernel that owns execution truth.
-
-We want this boundary even if we do not use JevLoop as the runtime itself.
+- **Foreman:** observe a worker, derive bounded checks, let deterministic policy act. This is the supervision shape.
+- **JevRouter:** models, agents, and strategies as capabilities; availability and permissions stay deterministic.
+- **Claudexor:** isolated candidates, cross-family review, bounded repair. This is the L2 shape, used only as escalation.
+- **JevLoop:** one durable event history with purpose-specific projections and a deterministic kernel that owns execution truth.
 
 ## What this experiment is not
 
 This repository is not intended to become:
 
-- a general-purpose agent framework on day one,
-- a replacement for Codex, OpenCode, or Pi,
+- a general-purpose agent framework,
+- a replacement for Codex, OpenCode, Pi, or Claude Code,
 - a 32-rollout benchmark harness,
-- an MCTS implementation,
-- a learned reward-model project,
-- a universal “AI committee,”
+- an MCTS or learned-reward-model project,
+- a multi-agent debate system,
 - or a prompt-only orchestration trick.
 
-The experiment should remain small enough that one developer can understand the full control flow.
+It should stay small enough for one developer to understand the full control flow.
 
-## Initial hypotheses
+## Hypotheses
 
-### H1 — Cheap routing beats always-frontier orchestration
+- **H1, refine over resample.** At matched compute, verifier-gated refinement (arm B) solves more tasks than two independent runs with verifier selection (arm R).
+- **H2, refinement over single run.** Arm B beats a single run (arm A) by enough to justify its added cost.
+- **H3, explicit cross-family critique matters.** Refinement driven by a structured critic beats refinement driven only by the raw verifier output. This is a secondary ablation.
+- **H4, Jev adds value over rules.** Jev-controlled refinement (arm C) beats rule-controlled refinement (arm B) on success or cost.
+- **H5, breadth after a stall helps.** Escalating to a deliberately different second candidate (arm D) recovers tasks that refinement alone could not.
+- **H6, harness diversity matters.** Candidates that differ by harness or model family recover more stalled tasks than same-configuration candidates.
+- **H7, evidence dominates.** No model opinion ever overrules a deterministic verifier result.
 
-A bounded router can avoid wasting frontier-model calls on obvious tasks without materially reducing successful outcomes.
-
-### H2 — Evidence-gated supervision beats blind retry
-
-Retries should happen because the worker is demonstrably stuck, verification failed, or a concrete flaw was found—not because a fixed loop counter says to “try again.”
-
-### H3 — Local repair beats full regeneration
-
-When the current trajectory is mostly good, steering or repairing the local failure should be cheaper and more stable than discarding all work and starting over.
-
-### H4 — Two genuinely different candidates are enough to test breadth value
-
-For difficult tasks, two isolated candidates using different worker/model configurations should reveal whether selective breadth is useful before we consider larger sampling.
-
-### H5 — Harness diversity may matter as much as model diversity
-
-Codex, OpenCode, and Pi differ not only by the models they can call, but also by tool use, context management, process semantics, and interaction patterns. The experiment should measure the whole worker configuration rather than assume “model name” is the only variable.
-
-### H6 — Deterministic evidence should dominate consensus
-
-If tests, compilers, repository checks, or other deterministic evidence can decide correctness, model voting should never overrule them.
+Each hypothesis maps to a pair of arms in `01-design.md` §15. A hypothesis without an arm comparison is not tested.
 
 ## Success criteria
 
-The experiment is promising if it can demonstrate, on realistic coding tasks, that an adaptive policy can improve one or more of these without unacceptable regressions in the others:
+The experiment is a success if it produces a **trustworthy comparison**. That means a fixed task corpus, repeated runs, recorded variance, and compute-matched arms, and it holds whether the result is positive or negative.
 
-- task success rate,
-- recovery from a bad initial trajectory,
-- frequency of unnecessary retries,
-- frontier-model usage,
-- total model cost,
+The approach is *promising* if an adaptive arm improves verified task success, or recovery from bad first attempts, without unacceptable regressions in:
+
+- tokens / quota / dollar cost (whichever the harness reports),
 - wall-clock time,
-- number of destructive/invalid actions,
-- and explainability of “why the orchestrator did that.”
-
-The first milestone does **not** require proving a universal benchmark win. It requires making the control loop observable enough that we can compare:
-
-1. single worker,
-2. supervised single worker,
-3. selectively escalated hard mode.
-
-## Preferred worker strategy
-
-Initial preference:
-
-1. **Codex** — primary strong coding worker.
-2. **OpenCode** — independent alternative worker / hard-mode candidate.
-3. **Pi Agent** — lightweight, embeddable worker and future model-agnostic adapter.
-4. **Claude Code** — optional future backend, not required for the architecture.
-
-The system should never encode assumptions such as “Codex is always the planner” or “OpenCode is always the critic.” Roles are assigned by capability and policy, not permanently by brand.
+- destructive or invalid actions,
+- explainability of "why the orchestrator did that".
 
 ## Portability and workstation boundary
 
-This repository is being created on the WebHarness ARM environment under:
-
-```text
-/home/ubuntu/repo/jev-ttc-orchestrator-experiment
-```
-
-The ARM environment is the design and planning workspace for this phase.
-
-A later phase will copy or clone the repository to the user's actual WebHMF workstation, where the real local agent environment can be inspected and adapters can be implemented against installed Codex, OpenCode, Pi, or other available harnesses.
-
-Therefore:
+This repository was created on WebHarness ARM, which is the planning workspace. Implementation and experiment runs happen on the user's **WebHMF** workstation. Therefore:
 
 - planning must not assume ARM-specific absolute paths,
-- worker adapters must be configurable,
-- process invocation must be isolated behind interfaces,
-- provider credentials must never be stored in the repository,
-- and environment discovery must happen on the target workstation rather than being guessed here.
+- worker adapters are configurable and built from observed interfaces,
+- process invocation is isolated behind interfaces,
+- provider credentials never enter the repository,
+- environment discovery happens on the target workstation, not by guessing here.
 
 ## Architectural principles
 
 1. **Models propose; deterministic code disposes.**
-2. **Spend extra compute only for a named reason.**
-3. **Prefer evidence over confidence language.**
-4. **Repair before restart when the trajectory is salvageable.**
-5. **Use diversity intentionally, not as blind resampling.**
-6. **Keep worker harness and underlying model separate.**
-7. **Keep the event history inspectable.**
-8. **Make every escalation explainable.**
-9. **Do not couple the design to Claude.**
-10. **Start with the smallest architecture that can falsify the hypotheses.**
+2. **Refine before resampling.**
+3. **Verification decides; critics find; Jev signals; rules act.**
+4. **Never accept a regression.**
+5. **Spend extra compute only for a recorded evidence reason.**
+6. **Diversity is deliberate, never just temperature.**
+7. **Compare every mechanism against a simpler arm at matched compute.**
+8. **Keep harness and model separate; bind no role to a vendor.**
+9. **Keep the event history inspectable; make every escalation explainable.**
+10. **Start with the smallest system that can falsify the hypotheses.**
 
-## Source projects studied
+## Sources
 
-The experiment is informed by architectural ideas from:
+- Refining Over Resampling: https://arxiv.org/abs/2608.05643
+- JevRouter: https://github.com/BillionsBobby/JevRouter
+- Foreman: https://github.com/thruwire/foreman
+- Claudexor: https://github.com/razzant/claudexor
+- JevLoop: https://github.com/parkavenue9639/jevloop
+- awesome-agent-orchestrators: https://github.com/andyrewlee/awesome-agent-orchestrators
+- awesome-jev: https://github.com/cobanov/awesome-jev
 
-- JevRouter — https://github.com/BillionsBobby/JevRouter
-- Foreman — https://github.com/thruwire/foreman
-- Claudexor — https://github.com/razzant/claudexor
-- JevLoop — https://github.com/parkavenue9639/jevloop
-- awesome-agent-orchestrators — https://github.com/andyrewlee/awesome-agent-orchestrators
-- awesome-jev — https://github.com/cobanov/awesome-jev
-
-These projects are references, not dependencies by default. Any code reuse must be evaluated separately for licensing, maintenance cost, and fit.
+These are references, not dependencies by default. Any code reuse is evaluated separately for licensing, maintenance cost, and fit.

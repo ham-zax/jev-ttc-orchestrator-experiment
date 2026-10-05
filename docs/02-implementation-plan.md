@@ -1,670 +1,231 @@
-# Jev-Gated Test-Time Compute Orchestrator Implementation Plan
+# Implementation Plan (revision 2)
 
-**Goal:** Build a portable local experiment runner that adaptively routes coding tasks between direct, supervised, and two-candidate breadth execution using Jev for bounded decisions, Codex/OpenCode/Pi-compatible worker adapters for coding, deterministic policy for control flow, and objective verification when available.
+**Goal:** A portable local experiment runner that executes coding tasks under several orchestration policies (arms) and produces comparable, inspectable evidence on whether verifier-gated refinement and selective breadth beat a single run and compute-matched resampling.
 
-**Architecture:** A TypeScript/Node.js control plane owns run state, budgets, worker lifecycle, workspace isolation, event history, and legal state transitions. Jev supplies typed routing and supervision signals but cannot execute actions directly. Coding harnesses sit behind a common worker interface; a strong reviewer is invoked only when semantic comparison or repair is required.
+**Architecture:** See `01-design.md`. A TypeScript/Node.js control plane owns run state, budgets, worker lifecycle, workspaces, checkpoints, and the event log. Workers (Codex / OpenCode / Pi / Claude Code) sit behind one streaming adapter contract. A critic drives refinement. Verifiers decide correctness. Rules or Jev supply bounded signals to a pure deterministic arbiter.
 
-**Tech Stack:** TypeScript, Node.js, JSONL event storage, YAML configuration, Jev decision API/SDK behind an adapter, Codex/OpenCode/Pi worker adapters, Git-backed isolated candidate workspaces.
+**Tech stack:** TypeScript, Node.js, `node:test`, JSONL events, YAML config, Git worktrees for workspaces and checkpoints, one schema-validation library, one YAML parser.
 
-## Global Constraints
+## Why phases instead of a full build
 
-- Prefer Codex, OpenCode, and Pi Agent as worker harnesses.
-- Do not require Claude Code.
-- Keep harness identity separate from underlying model identity.
-- Jev produces bounded signals; deterministic code owns side effects and state transitions.
-- Objective verification outranks model opinion.
-- Start with one worker by default and at most two candidates in breadth mode.
-- Permit at most one repair pass and one retry per candidate in the first experiment.
-- Do not implement MCTS, large Best-of-N sampling, learned PRMs, unbounded debate, or a general workflow engine.
-- Keep every escalation and action decision inspectable from the durable run history.
-- Keep credentials and machine-specific auth outside the repository.
-- Keep the repository portable from WebHarness ARM to the actual WebHMF workstation.
-- Do not assume target-workstation Codex/OpenCode/Pi invocation details until that workstation is inspected.
-- This implementation plan does not add a test suite or test-running work; experiment evaluation is handled through recorded runs and observable acceptance criteria.
+Revision 1 built the whole control plane (17 tasks) before collecting any data. Agent runs vary a lot from run to run, so it is easy to build everything and then be unable to tell whether it helped. Revision 2 is **data-first**:
 
-## Planned File Map
+1. define the corpus and measure the single-worker baseline and its variance,
+2. add one mechanism at a time,
+3. compare each mechanism against the simpler arm at matched compute,
+4. pass a **go/no-go gate** before building the next phase.
+
+## Global constraints
+
+- Follow every rule in `AGENTS.md`.
+- No adapter code before `docs/04-webhmf-environment.md` exists.
+- No comparative claims before `docs/05-experiment-protocol.md` exists and the baseline variance is recorded.
+- The pure core (policy, budgets, event fold, config validation, selection rules) has unit tests under `node:test`. Adapters are covered by recorded smoke runs, not mocks.
+- Experiment runs never touch production systems or real user data. Corpus repositories are disposable copies.
+
+---
+
+## Phase 0: Discovery, corpus, protocol (no runtime code)
+
+### 0.1 WebHMF environment discovery → `docs/04-webhmf-environment.md`
+
+For each of `codex`, `opencode`, `pi`, `claude`, record:
+
+- version and the structured interfaces available (App Server / exec JSON / server API / ACP / RPC / SDK / stream-json),
+- **session continuation** (can a follow-up message be sent to the same session after completion?),
+- mid-turn steering and cancellation semantics,
+- event-stream format, and how completion, tool calls, and errors appear,
+- **usage reporting** (tokens, cost, quota) and its granularity,
+- **nested subagent control** (can it be disabled? is subagent usage visible?),
+- model selection and model-family options,
+- workspace behavior (cwd handling, files written outside the repository).
+
+Also record Jev API/SDK availability and auth mechanism (no secret values) and Node.js / Git versions.
+
+Choose **one** primary integration surface per harness, plus a fallback only where observed behavior justifies it.
+
+**Acceptance:** enough observed detail to write each adapter without guessing; no secrets or user-specific absolute paths in portable defaults.
+
+### 0.2 Task corpus → `corpus/` + protocol section
+
+- 20–40 tasks across categories: straightforward change, bug fix, multi-file feature, ambiguous debugging, refactor, and at least a few tasks **without** existing tests (to exercise held-out acceptance checks).
+- Each task has a manifest: repository source, base revision, task text, verifier spec (command plus expected pass condition), category, and an estimated difficulty (for analysis only, never given to the router).
+- Preferred sources: historical bug-fix commits from the user's own repositories (revert the fix, keep its tests as the verifier), plus a small public subset such as SWE-bench-style tasks if feasible on WebHMF.
+- Every verifier is checked to **fail on the base revision and pass on the reference solution** before the task enters the corpus.
+
+### 0.3 Experiment protocol → `docs/05-experiment-protocol.md`
+
+- Arms (from `01-design.md` §15) and the order they are introduced.
+- Repeats: k ≥ 3 per (task, arm).
+- Isolation: every run starts from a fresh worktree at the base revision.
+- Pinned harness and model versions per comparison batch; record them in every report.
+- Compute unit for matching (tokens or wall-clock, depending on what 0.1 shows is reported).
+- Analysis: paired per-task comparisons and success rate with intervals. State upfront that a small corpus supports exploratory conclusions only.
+- Go/no-go criteria for every phase gate below, written **before** the data is seen.
+
+**Gate 0:** discovery file exists, corpus verifiers validated, protocol written.
+
+---
+
+## Phase 1: Walking skeleton + baseline (arms A and R)
+
+### 1.1 Bootstrap
+
+`package.json`, `tsconfig.json`, `.gitignore` (run artifacts, worktrees, local config, env files), `config/example.yaml`, and a CLI `main.ts` with two commands: `run <task>` (one task, one arm) and `experiment <corpus> --arms ... --repeats k`. Typed errors.
+
+### 1.2 Core types, events, budgets, policy skeleton
+
+`core/types.ts`, `events.ts`, `budgets.ts`, `state.ts` (event fold), `policy.ts` (arbiter limited to the L0 actions for now). **Unit tests:** budget checks, event fold, legal and illegal transitions.
+
+### 1.3 Config schema and loading
+
+Validate workers, roles, ladder parameters, and budgets. Reject >2 candidates, D>3, unknown workers, and secret literals. **Unit tests** for validation.
+
+### 1.4 Event store and run report
+
+Append-only JSONL per run, monotonic sequence numbers, config snapshot event, and a terminal + JSON report including the verifier score, compute usage, and the arbiter reason trail.
+
+### 1.5 Worktree workspace provider
+
+Create a worktree from the base revision for each run, record the base revision and changed files, and never auto-delete a worktree with unreported changes after an abnormal stop.
+
+### 1.6 First worker adapter
+
+Implement the **one** adapter that 0.1 showed is simplest and most observable, as an event stream, with usage capture and nested subagents disabled.
+
+### 1.7 Command verifier
+
+Run the task's verifier spec in the workspace, parse a `{passed,total}` score where the runner exposes one (fall back to pass/fail), and bound and store its output.
+
+### 1.8 Experiment runner, arms A and R
+
+Arm A: one run, then verify. Arm R: two independent runs in separate worktrees; the verifier picks; ties are broken by the smaller diff and recorded as ties. Run the corpus with k repeats.
+
+**Gate 1:** baseline success rate and **variance** recorded. If arm A already solves almost everything, the corpus is too easy and must be extended before going on. If R does not beat A at all, note it: the paper predicts weak resampling gains.
+
+---
+
+## Phase 2: Refinement (arms B and B0)
+
+### 2.1 Checkpoint store
+
+Commit per accepted round, tagged with the score; revert to the best checkpoint. **Unit tests** for acceptance rules (better, equal, and worse score).
+
+### 2.2 Session continuation in the adapter
+
+Implement `send` if 0.1 found resume support; otherwise use the fresh-session-on-checkpoint fallback and record it.
+
+### 2.3 Critic
+
+Structured `Critique` schema with validation, run on a cross-family descriptor where configured. Invalid output becomes `noConcreteDefect` plus an error event.
+
+### 2.4 RulesProvider
+
+Stuck detection (repeated failing command, no workspace change for T) and a repair-likely rule from critique flags. **Unit tests.**
+
+### 2.5 L1 loop in the arbiter
+
+CRITIQUE → CORRECT → VERIFY → ACCEPT/REVERT, the stall rules, and the D limit. **Unit tests** for every transition and stop condition.
+
+### 2.6 Arms B and B0
+
+B0 skips the critic and feeds only the verifier output to the correction. Run the corpus with compute recorded, and **re-budget R to B's median compute** for the comparison.
+
+**Gate 2:** compare B against A and R (H1, H2) and B against B0 (H3), with the recovery rate per round. **If B does not beat R at matched compute, stop and reassess before Phase 3 or 4.** The core thesis has not held for coding, and adding Jev or breadth on top would not be justified.
+
+---
+
+## Phase 3: Jev decisions (arm C)
+
+### 3.1 DecisionProvider interface plus JevProvider
+
+Bounded questions over the compact projection, strict schema parsing, out-of-range values rejected, and fallback to RulesProvider on any error (recorded). Record a digest of the input projection and the parsed output for every call.
+
+### 3.2 Arm C
+
+Same as B, with signals from Jev. Record Jev calls, latency, and cost.
+
+**Gate 3:** C against B (H4). If Jev does not improve success or cost, keep RulesProvider as the default and leave Jev as an optional provider. Do not add more Jev signals to rescue it without a specific observed failure.
+
+---
+
+## Phase 4: Second adapter and breadth (arms R' and D)
+
+### 4.1 Remaining adapters
+
+Add the other harnesses from 0.1 in order of expected value. Each conforms to the same contract and passes a recorded smoke run on two corpus tasks.
+
+### 4.2 Diversity validation
+
+Config validation rejects a breadth pair that differs only in temperature (except in arm R). **Unit tests.**
+
+### 4.3 L2 in the arbiter
+
+Second isolated candidate, independent of A, with its own L0→L1 loop (D_B ≤ 2), verifier-first selection, and an `unresolved` outcome. **Unit tests** for the selection rules.
+
+### 4.4 Reviewer (tie only)
+
+Structured preference or "no preference"; at most one call.
+
+### 4.5 Arms R' and D
+
+**Gate 4:** D against B on tasks where B stalled (H5), and D against R' (H6). Breadth is kept only if it recovers stalled tasks at an acceptable cost.
+
+---
+
+## Phase 5: Held-out acceptance checks, optional predictive entry, conclusions
+
+### 5.1 Held-out acceptance checks
+
+A test-author worker writes checks from the task text, which are stored outside the workspace, validated by requiring failure on the base revision, and copied in at verify time. Evaluate them on the corpus's no-test tasks, and on test-having tasks with the real tests hidden, to measure how well the generated checks agree with ground truth.
+
+### 5.2 Arm E (optional)
+
+Jev predictive entry, compared against D on cost and wall-clock.
+
+### 5.3 Comparative report and documentation
+
+`reporting/compare.ts` produces per-arm tables and paired comparisons. Update `README.md`, `00-rationale.md`, and `01-design.md` (revision log) with the results, the invalidated assumptions, and which next step, if any, the evidence justifies.
+
+---
+
+## Dependency order
 
 ```text
-README.md
-package.json
-tsconfig.json
-.gitignore
-
-config/
-  example.yaml
-
-src/
-  cli/
-    main.ts
-
-  core/
-    types.ts
-    events.ts
-    budgets.ts
-    policy.ts
-    errors.ts
-
-  config/
-    schema.ts
-    load.ts
-
-  decisions/
-    provider.ts
-    schemas.ts
-    jev.ts
-
-  routing/
-    router.ts
-
-  supervisor/
-    supervisor.ts
-
-  workers/
-    adapter.ts
-    registry.ts
-    process-worker.ts
-    codex.ts
-    opencode.ts
-    pi.ts
-
-  verification/
-    adapter.ts
-    registry.ts
-    command.ts
-
-  review/
-    reviewer.ts
-
-  runtime/
-    event-store.ts
-    workspace.ts
-    orchestrator.ts
-
-  reporting/
-    run-report.ts
-
-docs/
-  00-rationale.md
-  01-design.md
-  02-implementation-plan.md
-  03-research-references.md          # external investigation and takeover map
-  04-webhmf-environment.md           # created during WebHMF integration
-  05-experiment-protocol.md          # created before comparative runs
+Phase 0  discovery + corpus + protocol       (gate 0)
+Phase 1  skeleton, 1 adapter, arms A/R       (gate 1: baseline + variance)
+Phase 2  refinement, arms B/B0               (gate 2: B vs R at matched compute; core thesis)
+Phase 3  Jev, arm C                          (gate 3: Jev vs rules)
+Phase 4  more adapters + breadth, arms R'/D  (gate 4: breadth after stall)
+Phase 5  acceptance checks, arm E, report
 ```
 
----
-
-### Task 1: Bootstrap the minimal TypeScript control-plane repository
-
-**Files:**
-- Create: `package.json`
-- Create: `tsconfig.json`
-- Create: `.gitignore`
-- Create: `config/example.yaml`
-- Create: `src/cli/main.ts`
-- Create: `src/core/errors.ts`
-
-**Interfaces:**
-- Consumes: the architecture constraints in `docs/01-design.md`
-- Produces: a runnable local CLI entry point and repository-wide configuration conventions used by all later tasks
-
-**Steps:**
-- [ ] Configure the package as a private TypeScript project with Node.js as the runtime.
-- [ ] Use a small dependency surface: schema validation plus YAML parsing; use Node built-ins for CLI parsing and subprocess control unless a concrete need appears.
-- [ ] Define scripts for build and CLI execution without introducing a framework-specific runtime.
-- [ ] Add ignored local paths for run artifacts, temporary workspaces, local configuration, credentials, and environment files.
-- [ ] Create `config/example.yaml` with routing thresholds, budgets, worker descriptors, run-artifact location, and verification configuration; contain no real credentials or absolute machine paths.
-- [ ] Create a CLI entry point that parses a task, optional execution-tier override, config path, and repository/workspace path, then delegates to an orchestrator interface that later tasks will supply.
-- [ ] Define typed user-facing configuration and runtime errors rather than throwing anonymous strings.
-
-**Acceptance criteria:**
-- The repository has a small, understandable Node/TypeScript entry point.
-- Example configuration expresses all current policy knobs without exposing secrets.
-- No worker or Jev implementation details leak into CLI argument parsing.
-
----
-
-### Task 2: Define authoritative run types, events, budgets, and legal policy actions
-
-**Files:**
-- Create: `src/core/types.ts`
-- Create: `src/core/events.ts`
-- Create: `src/core/budgets.ts`
-- Create: `src/core/policy.ts`
-
-**Interfaces:**
-- Consumes: execution tiers and action vocabulary from `docs/01-design.md`
-- Produces: shared types for task envelopes, worker observations, candidate state, run state, budgets, events, and deterministic runtime actions
-
-**Steps:**
-- [ ] Define `TaskEnvelope`, `ExecutionTier`, `CandidateId`, `RunId`, `WorkerDescriptor`, `VerificationResult`, and `ReviewerFinding`.
-- [ ] Define the legal `RuntimeAction` union: `CONTINUE`, `VERIFY`, `STEER`, `RETRY`, `ESCALATE`, `START_SECOND_CANDIDATE`, `REVIEW`, `REPAIR`, `FINISH`, `FAIL`.
-- [ ] Define immutable event payload types for run start, routing, worker lifecycle, observations, decision signals, arbiter actions, verification, review, repair, completion, and failure.
-- [ ] Define `RunBudget` and `BudgetUsage` with limits for elapsed time, worker invocations, candidate count, Jev decisions, reviewer calls, retries, and repairs.
-- [ ] Implement pure budget-check helpers that return allowed/denied plus a reason.
-- [ ] Implement a pure deterministic policy function that accepts current state, signals, evidence, availability, and budget, and returns exactly one legal action plus a machine-readable reason.
-- [ ] Make illegal transitions explicit errors rather than silent fallbacks.
-
-**Acceptance criteria:**
-- Later modules can express orchestration state without importing any provider-specific SDK.
-- Every side-effecting action has a typed deterministic-policy path.
-- Budget exhaustion always maps to an explicit finish/fail decision rather than an implicit loop exit.
-
----
-
-### Task 3: Implement configuration loading and schema validation
-
-**Files:**
-- Create: `src/config/schema.ts`
-- Create: `src/config/load.ts`
-- Modify: `config/example.yaml`
-
-**Interfaces:**
-- Consumes: YAML configuration
-- Produces: validated `OrchestratorConfig` used by routing, budgets, workers, verification, and reporting
-
-**Steps:**
-- [ ] Define the configuration schema for routing thresholds, budgets, worker descriptors, run-artifact directory, optional reviewer descriptor, and verification discovery policy.
-- [ ] Reject unknown execution tiers, negative budgets, more than two configured breadth candidates for v0, and configurations that request a worker not present in the registry.
-- [ ] Permit environment-variable references for secrets/provider endpoints without persisting resolved secret values into run events.
-- [ ] Normalize relative paths from the repository root rather than relying on ARM-specific absolute paths.
-- [ ] Make explicit CLI mode overrides take precedence over automatic routing while still recording the override in the run history.
-
-**Acceptance criteria:**
-- A validated configuration is environment-neutral.
-- Machine paths and credentials are not required in committed configuration.
-- v0 limits are enforced centrally rather than scattered across adapters.
-
----
-
-### Task 4: Build the append-only event store and run projections
-
-**Files:**
-- Create: `src/runtime/event-store.ts`
-- Modify: `src/core/events.ts`
-- Modify: `src/core/types.ts`
-
-**Interfaces:**
-- Consumes: typed `RunEvent` objects
-- Produces: append-only JSONL run history plus reconstructed runtime/Jev/reviewer projections
-
-**Steps:**
-- [ ] Store each run in its own artifact directory with one append-only JSONL event log.
-- [ ] Assign monotonically increasing sequence numbers within a run.
-- [ ] Implement reconstruction of authoritative `RunState` by folding events rather than maintaining an unrelated shadow state.
-- [ ] Implement a compact Jev projection containing bounded factual state only.
-- [ ] Implement a richer reviewer projection containing task, relevant worker output/diff summaries, verification results, and explicit constraints.
-- [ ] Exclude credentials, raw auth material, and unrelated environment variables from all event payloads.
-- [ ] Record the policy configuration snapshot or digest needed to explain historical routing decisions.
-
-**Acceptance criteria:**
-- A completed or interrupted run can be explained from its event history.
-- Jev and reviewer contexts are projections of the same authoritative history rather than independent memories.
-- Sensitive machine auth data is absent from persisted run artifacts.
-
----
-
-### Task 5: Define Jev decision contracts without giving Jev execution authority
-
-**Files:**
-- Create: `src/decisions/provider.ts`
-- Create: `src/decisions/schemas.ts`
-- Create: `src/decisions/jev.ts`
-
-**Interfaces:**
-- Consumes: compact task/run projections
-- Produces: validated `RoutingSignals` and `SupervisionSignals`
-
-**Steps:**
-- [ ] Define `DecisionProvider` with separate methods for routing and supervision signals.
-- [ ] Define strict schemas for difficulty, breadth value, verification value, ambiguity, consequence, preferred capability IDs, stuck probability, progress quality, verification need, local-repair likelihood, escalation usefulness, and completion plausibility.
-- [ ] Implement the Jev adapter so provider responses are parsed into those schemas and invalid/out-of-range values are rejected.
-- [ ] Keep provider transport configuration injectable so WebHMF discovery can select the available Jev SDK/API mechanism without changing routing code.
-- [ ] Implement a deterministic Jev-unavailable fallback result that cannot automatically trigger breadth mode.
-- [ ] Record each decision request's non-secret input projection digest and parsed output as events.
-
-**Acceptance criteria:**
-- Jev cannot return a free-form executable command to the runtime.
-- A malformed Jev response cannot directly cause a worker action.
-- If Jev is unavailable, the system remains usable in a conservative deterministic mode.
-
----
-
-### Task 6: Implement capability routing
-
-**Files:**
-- Create: `src/routing/router.ts`
-- Modify: `src/core/policy.ts`
-- Modify: `src/core/events.ts`
-
-**Interfaces:**
-- Consumes: task envelope, validated worker registry, routing signals, budget, explicit user overrides
-- Produces: `DIRECT`, `SUPERVISED`, or `BREADTH` plus selected worker descriptor IDs and an inspectable reason
-
-**Steps:**
-- [ ] Normalize raw task input into the minimum routing context needed by Jev.
-- [ ] Apply deterministic availability and policy constraints before model preference.
-- [ ] Implement explicit override behavior for reproducible experiment runs.
-- [ ] Route high-consequence tasks to at least supervised mode.
-- [ ] Permit breadth only when a second compatible worker exists, the breadth signal crosses the configured threshold, and budget allows two candidates.
-- [ ] Record both Jev signals and the deterministic routing decision separately.
-- [ ] Avoid permanently assigning cognitive roles such as “critic” or “planner” to a vendor name.
-
-**Acceptance criteria:**
-- The same routing signals and configuration always produce the same route.
-- Breadth cannot occur merely because two workers are installed.
-- A route explains which signal, threshold, override, or availability rule caused it.
-
----
-
-### Task 7: Implement the worker abstraction and registry
-
-**Files:**
-- Create: `src/workers/adapter.ts`
-- Create: `src/workers/registry.ts`
-- Create: `src/workers/process-worker.ts`
-
-**Interfaces:**
-- Consumes: worker descriptors and task/candidate inputs
-- Produces: worker handles, structured observations, optional steering, termination, and final worker results
-
-**Steps:**
-- [ ] Define `WorkerAdapter`, `WorkerHandle`, `WorkerCapabilities`, `WorkerObservation`, and `WorkerResult`.
-- [ ] Represent live steering, structured-event support, cancellation, and underlying-model metadata as capabilities rather than assumptions.
-- [ ] Implement shared subprocess lifecycle utilities with explicit stdout/stderr capture, cancellation, exit status, and bounded output retention.
-- [ ] Build a registry that resolves configured worker descriptor IDs to adapter implementations.
-- [ ] Reject duplicate worker IDs and descriptors whose declared capabilities contradict their adapter.
-- [ ] Ensure adapter output is converted into typed observations before it enters supervision.
-
-**Acceptance criteria:**
-- Runtime/orchestrator code does not know Codex/OpenCode/Pi command syntax.
-- A worker that cannot steer can still participate through deterministic stop/retry semantics.
-- The registry can hold multiple Pi descriptors backed by different underlying models.
-
----
-
-### Task 8: Perform WebHMF worker/environment discovery before implementing real worker commands
-
-**Files:**
-- Create on the target workstation: `docs/04-webhmf-environment.md`
-- Modify after discovery: `config/example.yaml` only if new portable capability fields are required
-
-**Interfaces:**
-- Consumes: actual WebHMF workstation installations and authenticated local agent environments
-- Produces: a concrete adapter contract for Codex, OpenCode, and Pi based on observed interfaces rather than guessed invocation syntax
-
-**Steps:**
-- [ ] After the repository is copied/cloned to WebHMF, inspect installed Codex version and available structured interfaces, including whether App Server, exec, or another local integration is available.
-- [ ] Inspect OpenCode version and its available process/API/event surfaces.
-- [ ] Inspect Pi installation and whether RPC, SDK, or CLI mode is the narrowest stable integration.
-- [ ] Record executable locations only as discovery evidence; do not commit user-specific absolute paths into portable defaults.
-- [ ] Record each harness's cancellation semantics, structured-event support, live-steering support, workspace behavior, and model-selection mechanism.
-- [ ] Record Jev client/credential availability without copying credentials into the document.
-- [ ] Choose one primary integration surface per harness and one fallback only where observed behavior justifies it.
-
-**Acceptance criteria:**
-- `docs/04-webhmf-environment.md` contains enough observed detail to implement all three adapters without guessing.
-- No provider token, cookie, credential cache, or secret value is added to Git.
-- Adapter implementation begins only after this discovery artifact exists.
-
----
-
-### Task 9: Implement Codex, OpenCode, and Pi adapters from workstation evidence
-
-**Files:**
-- Create: `src/workers/codex.ts`
-- Create: `src/workers/opencode.ts`
-- Create: `src/workers/pi.ts`
-- Modify: `src/workers/registry.ts`
-- Modify: `src/config/schema.ts`
-
-**Interfaces:**
-- Consumes: the exact integration surfaces recorded in `docs/04-webhmf-environment.md`
-- Produces: three conforming `WorkerAdapter` implementations
-
-**Steps:**
-- [ ] Implement Codex using the richest stable structured interface discovered on WebHMF; expose live steering only if that interface actually supports it.
-- [ ] Implement OpenCode using its observed structured/process interface and map its lifecycle to the common worker events.
-- [ ] Implement Pi using the discovered RPC/SDK/CLI mechanism, preserving separation between Pi as a harness and its configured underlying model.
-- [ ] Normalize completion, failure, tool/event, and cancellation behavior into shared observation types.
-- [ ] Keep provider/model-specific flags in descriptor configuration rather than branching throughout orchestrator code.
-- [ ] Surface unsupported requested capabilities as deterministic configuration errors.
-
-**Acceptance criteria:**
-- Codex, OpenCode, and Pi can each be selected by descriptor ID without changing orchestrator code.
-- A worker's model can be changed through configuration where the harness supports it.
-- Worker-specific process details remain isolated inside the adapter modules.
-
----
-
-### Task 10: Implement workspace isolation for breadth candidates
-
-**Files:**
-- Create: `src/runtime/workspace.ts`
-- Modify: `src/core/events.ts`
-- Modify: `src/core/types.ts`
-
-**Interfaces:**
-- Consumes: source repository path and candidate ID
-- Produces: isolated candidate workspace path and cleanup metadata
-
-**Steps:**
-- [ ] Define a workspace-provider interface so the runner can use Git worktrees or another safe local isolation method.
-- [ ] For Git repositories, create candidate-specific worktrees/branches without allowing candidate A and B to mutate the same working tree.
-- [ ] Record base revision, candidate workspace identity, and final changed-file summary in run events.
-- [ ] Refuse breadth mode when safe isolation cannot be established.
-- [ ] Keep cleanup explicit; do not silently delete a candidate workspace containing unreported changes after an abnormal stop.
-
-**Acceptance criteria:**
-- Two breadth candidates never share a mutable working tree.
-- The final report can identify which candidate produced which diff.
-- An interrupted breadth run does not destroy evidence needed for diagnosis.
-
----
-
-### Task 11: Implement verification adapters and evidence precedence
-
-**Files:**
-- Create: `src/verification/adapter.ts`
-- Create: `src/verification/registry.ts`
-- Create: `src/verification/command.ts`
-- Modify: `src/core/policy.ts`
-
-**Interfaces:**
-- Consumes: repository/task verification configuration and candidate workspace
-- Produces: typed verification evidence with command/source, exit state, bounded output, and pass/fail/unknown status
-
-**Steps:**
-- [ ] Define a generic verification-adapter contract independent of worker identity.
-- [ ] Implement an explicit command verifier for repository-provided commands configured by the user or discovered from authoritative repository instructions.
-- [ ] Represent “no objective verifier available” as `unknown`, not success.
-- [ ] Give deterministic passing/failing verification precedence over reviewer preference in the arbiter.
-- [ ] Bound captured command output and retain a path/reference when full output must remain in run artifacts.
-- [ ] Record each verifier invocation and result in the event stream.
-
-**Acceptance criteria:**
-- A model cannot overrule a deterministic failing verifier.
-- Absence of verification is visible in the final status/report.
-- Verification configuration is repository/task-specific rather than globally invented by the orchestrator.
-
----
-
-### Task 12: Implement supervised single-worker execution
-
-**Files:**
-- Create: `src/supervisor/supervisor.ts`
-- Create: `src/runtime/orchestrator.ts`
-- Modify: `src/core/policy.ts`
-- Modify: `src/runtime/event-store.ts`
-
-**Interfaces:**
-- Consumes: routed task, selected worker, Jev provider, verification registry, budgets
-- Produces: an event-driven supervised run that terminates in finish/fail/escalate
-
-**Steps:**
-- [ ] Start the selected worker and emit worker lifecycle events.
-- [ ] Create coarse observation checkpoints from worker completion claims, command failures, material diff changes, explicit agent pauses, or structured worker events.
-- [ ] At eligible checkpoints, build the compact Jev projection and request supervision signals.
-- [ ] Pass signals, current evidence, and budget into deterministic policy.
-- [ ] Implement `CONTINUE`, `VERIFY`, `STEER`, `RETRY`, `ESCALATE`, `FINISH`, and `FAIL` transitions.
-- [ ] Convert `STEER` to deterministic stop/retry behavior when the active adapter cannot live-steer.
-- [ ] Enforce one retry per candidate and reject any retry request after budget exhaustion.
-- [ ] Return the best verified state on budget stop and label incomplete/unverified outcomes accurately.
-
-**Acceptance criteria:**
-- A supervised run never loops solely because “more reasoning might help.”
-- Every retry or escalation has an event-recorded evidence reason.
-- Unsupported live steering degrades predictably rather than crashing the run.
-
----
-
-### Task 13: Implement reviewer and localized repair
-
-**Files:**
-- Create: `src/review/reviewer.ts`
-- Modify: `src/core/types.ts`
-- Modify: `src/core/policy.ts`
-- Modify: `src/runtime/orchestrator.ts`
-
-**Interfaces:**
-- Consumes: reviewer projection plus one or two candidate states
-- Produces: structured keep/repair/reject findings, localized defect description, and preferred candidate when comparison is required
-
-**Steps:**
-- [ ] Define reviewer output as structured findings rather than unrestricted “pick a winner” prose.
-- [ ] Require the reviewer to separate deterministic evidence from semantic judgment.
-- [ ] Capture strongest assumption, weakest assumption, concrete defect, missing edge cases, and keep/repair/reject recommendation.
-- [ ] Permit repair only when the arbiter confirms repair budget remains and the finding is localized.
-- [ ] Send a repair instruction to the chosen worker that preserves valid work and targets the recorded defect.
-- [ ] After repair, return to verification rather than automatically requesting another reviewer round.
-- [ ] Enforce a maximum of one repair pass in v0.
-
-**Acceptance criteria:**
-- The runtime can explain exactly what defect triggered repair.
-- A repair does not erase the prior candidate history.
-- A failed repair cannot trigger an unbounded reviewer/repair loop.
-
----
-
-### Task 14: Implement two-candidate breadth mode
-
-**Files:**
-- Modify: `src/runtime/orchestrator.ts`
-- Modify: `src/runtime/workspace.ts`
-- Modify: `src/review/reviewer.ts`
-- Modify: `src/core/policy.ts`
-
-**Interfaces:**
-- Consumes: BREADTH route, two worker descriptors, isolated workspaces, verifier, reviewer, budget
-- Produces: candidate A/B evidence and one final accepted/repaired/unresolved result
-
-**Steps:**
-- [ ] Create two isolated candidate workspaces from the same base revision.
-- [ ] Start candidate A and B with intentionally distinct worker/model configurations or strategy instructions recorded in run state.
-- [ ] Permit concurrent execution only when both adapters and the configured runtime budget safely support it; otherwise execute sequentially while preserving isolation.
-- [ ] Run applicable deterministic verification independently for both candidates.
-- [ ] If deterministic evidence clearly establishes one valid candidate and the other invalid, allow the arbiter to select without semantic voting.
-- [ ] Otherwise invoke one reviewer comparison.
-- [ ] Allow one localized repair of the selected candidate when justified.
-- [ ] Re-run applicable deterministic verification after repair.
-- [ ] Mark the run unresolved when evidence remains genuinely conflicting after allowed review/repair budget.
-
-**Acceptance criteria:**
-- Breadth mode never runs more than two candidates in v0.
-- Candidate diversity is recorded explicitly.
-- Deterministic evidence can short-circuit unnecessary reviewer work.
-- Lack of consensus is allowed to remain unresolved instead of being hidden by forced voting.
-
----
-
-### Task 15: Build run reporting and inspectable explanations
-
-**Files:**
-- Create: `src/reporting/run-report.ts`
-- Modify: `src/cli/main.ts`
-- Modify: `src/runtime/event-store.ts`
-
-**Interfaces:**
-- Consumes: completed or interrupted run event history
-- Produces: concise terminal report plus machine-readable JSON summary
-
-**Steps:**
-- [ ] Report execution tier, selected worker configurations, final status, verification status, elapsed time, retry/repair/escalation counts, Jev-decision count, reviewer count, and available cost/token metadata.
-- [ ] Include a chronological “why” summary for route, retry, escalation, breadth, repair, and finish decisions.
-- [ ] Distinguish verified success, unverified completion, budget stop, policy stop, worker failure, and unresolved disagreement.
-- [ ] Include candidate comparison metadata for breadth runs without dumping unnecessary private model reasoning.
-- [ ] Print artifact paths for the event log and preserved candidate workspaces when relevant.
-
-**Acceptance criteria:**
-- A developer can answer “why did this become a two-agent run?” from the report without reading source code.
-- A run never labels an unverified or unresolved state as verified success.
-- Reports do not expose provider credentials or unrelated environment information.
-
----
-
-### Task 16: Add explicit baseline and experiment execution modes
-
-**Files:**
-- Modify: `src/cli/main.ts`
-- Modify: `src/runtime/orchestrator.ts`
-- Modify: `src/reporting/run-report.ts`
-- Create: `docs/05-experiment-protocol.md`
-
-**Interfaces:**
-- Consumes: a task corpus selected for the experiment and an explicit mode
-- Produces: comparable run artifacts for single-worker baseline, supervised single-worker, and adaptive routing
-
-**Steps:**
-- [ ] Add explicit `baseline-single`, `supervised-single`, and `adaptive` modes that share worker and verification infrastructure.
-- [ ] In the protocol document, define how the same task/repository starting state is reused across modes without allowing one run's mutations to contaminate another.
-- [ ] Define the experiment's comparison fields: final status, verification status, worker calls, Jev calls, reviewer calls, retries, repairs, elapsed time, and available cost metadata.
-- [ ] Require intentional task categories such as straightforward changes, ambiguous debugging, multi-file implementation, and tasks with objective verification.
-- [ ] Document that the initial experiment is exploratory and should not claim universal model superiority from a small local sample.
-- [ ] Keep model/harness versions in each run report so later comparisons remain interpretable.
-
-**Acceptance criteria:**
-- The same orchestrator can produce all three comparison modes.
-- Experiment artifacts are comparable without needing to infer hidden differences in policy.
-- The protocol distinguishes harness effects from underlying-model effects when configuration permits.
-
----
-
-### Task 17: Update repository documentation after the first runnable experiment
-
-**Files:**
-- Create: `README.md` during bootstrap, then modify after first runnable experiment
-- Modify: `docs/00-rationale.md`
-- Modify: `docs/01-design.md`
-- Modify: `docs/05-experiment-protocol.md`
-
-**Interfaces:**
-- Consumes: actual implemented behavior and first-run evidence
-- Produces: documentation that describes the real system rather than the original assumptions
-
-**Steps:**
-- [ ] Make README show the actual execution modes and supported worker adapters.
-- [ ] Record any design assumption invalidated by WebHMF discovery.
-- [ ] Keep architectural deviations explicit rather than silently rewriting history.
-- [ ] Document known limitations discovered during real Codex/OpenCode/Pi runs.
-- [ ] Identify which next complexity, if any, is justified by evidence: better routing signals, richer verification, more robust steering, or broader search.
-
-**Acceptance criteria:**
-- Documentation matches the implemented control flow.
-- Unsupported features are not presented as available.
-- Any proposal for additional orchestration complexity is tied to a concrete observed limitation.
-
-## Dependency Order
-
-```text
-Tasks 1-7
-  portable control-plane foundations on the repository
-
-Task 8
-  WebHMF discovery boundary
-
-Task 9
-  real Codex/OpenCode/Pi adapters
-
-Tasks 10-13
-  workspace isolation, verification, supervision, repair
-
-Task 14
-  selective breadth
-
-Tasks 15-16
-  reporting and comparative experiment runner
-
-Task 17
-  evidence-based documentation update
-```
-
-## Initial Milestones
-
-### Milestone A — Portable control plane
-
-Tasks 1-7 complete.
-
-Observable result: the repository contains the typed state machine, event history, routing policy, Jev decision contract, and worker abstraction without assuming workstation-specific command syntax.
-
-### Milestone B — Real local workers
-
-Tasks 8-9 complete on WebHMF.
-
-Observable result: Codex, OpenCode, and Pi can each be launched through the same worker interface using the actual installed environment.
-
-### Milestone C — Supervised single-worker experiment
-
-Tasks 10-13 complete.
-
-Observable result: one selected worker can be observed, verified, steered/retried, escalated, repaired once, and terminated through inspectable deterministic policy.
-
-### Milestone D — Selective breadth experiment
-
-Task 14 complete.
-
-Observable result: a hard task can produce two isolated candidates, compare objective evidence, invoke one semantic reviewer when necessary, repair once, and return a verified or explicitly unresolved result.
-
-### Milestone E — Comparative evidence
-
-Tasks 15-17 complete.
-
-Observable result: baseline-single, supervised-single, and adaptive modes produce comparable reports that show whether the extra orchestration is buying enough quality/recovery to justify its cost.
-
-## Risk Register
-
-### Routing overconfidence
-
-A bounded decision model can still make bad classifications.
-
-Mitigation: signals never execute actions directly; deterministic thresholds, availability, explicit mode overrides, and run history remain authoritative.
-
-### Agent-interface drift
-
-Codex, OpenCode, or Pi interfaces may differ from assumptions or change over time.
-
-Mitigation: target-workstation discovery is a required implementation phase, and each harness is isolated behind a worker adapter.
-
-### Orchestrator complexity overwhelms the benefit
-
-It is easy to build a sophisticated controller whose overhead exceeds the quality gained.
-
-Mitigation: DIRECT is the default cheap path; BREADTH is capped at two candidates; every new mechanism must be justified by experiment evidence.
-
-### Correlated candidates
-
-Two workers may still produce nearly identical approaches.
-
-Mitigation: record the worker/model/strategy configuration for each candidate and intentionally diversify one dimension before considering more samples.
-
-### Reviewer becomes another unverified authority
-
-A strong frontier reviewer can still be wrong.
-
-Mitigation: deterministic verification outranks reviewer preference; reviewer output is structured as findings and repair suggestions, not final truth.
-
-### Workspace damage
-
-Parallel agents can conflict if they mutate the same files.
-
-Mitigation: breadth requires isolated workspaces and refuses to start when isolation cannot be established.
-
-### Hidden cost growth
-
-Repeated supervision or review can silently turn a cheap task into an expensive one.
-
-Mitigation: explicit per-run budgets and reportable counts for every worker, Jev, reviewer, retry, repair, and escalation call.
-
-## Completion Definition for the First Experiment
-
-The first experiment is complete when:
-
-1. one task can run in single-worker baseline mode;
-2. the same task can run under supervised-single mode;
-3. a hard task can be selectively routed into a two-candidate breadth run;
-4. objective verification, when configured, determines success/failure ahead of model preference;
-5. at most one repair and one retry per candidate are enforced;
-6. each run produces an inspectable event history and report explaining routing and escalation;
-7. Codex, OpenCode, and Pi are supported through the same worker contract on WebHMF;
-8. no architecture component requires Claude Code;
-9. secrets and workstation-specific auth remain outside Git;
-10. the comparative report is sufficient to decide whether further test-time-compute complexity is justified.
+Phases 3 and 4 are independent of each other once gate 2 passes, and may run in either order.
+
+## Risk register
+
+| Risk | Mitigation |
+|---|---|
+| Run-to-run variance swamps any effect | k ≥ 3 repeats, paired comparisons, baseline variance measured first (gate 1) |
+| Paper's gains don't transfer to frontier coding agents | Compute-matched R arm; gate 2 stops the project early if refinement doesn't beat resampling |
+| Refinement degrades working code | Checkpoints plus no-regression acceptance; the regressions count is reported |
+| Self-critique misses the worker's own errors | Cross-family critic; the B0 ablation measures the critic's value |
+| Threshold overfitting on a small corpus | Few signals; thresholds fixed in the protocol before runs |
+| Workers game visible tests | Held-out acceptance checks stored outside the workspace |
+| Hidden cost from nested subagents | Disabled during experiments, or counted and flagged |
+| Correlated breadth candidates | Mandatory recorded diversity dimension; R' arm measures it |
+| Harness interface drift | Phase 0 discovery; versions pinned per batch and recorded in reports |
+| Cost unavailable on subscription logins | Tokens and wall-clock as the matching unit |
+| Workspace interference (shared caches, ports, databases) | Worktrees per candidate; no claim of sandboxing; corpus repositories are disposable |
+| Orchestrator overhead exceeds benefit | Each phase is gated; null results are reported, not hidden |
+
+## Completion definition for the first experiment
+
+1. The corpus and protocol exist, and the verifiers are validated.
+2. Arms A, R, B, and B0 have k-repeat results with variance and matched compute.
+3. Gate 2 is decided and documented.
+4. If gate 2 passed: arms C, R', and D have results, and gates 3 and 4 are decided.
+5. Every run has an event log and a report explaining every escalation.
+6. At least two harnesses work through the same contract; Claude Code is supported but not required.
+7. No secrets or workstation-specific auth in Git.
+8. The documentation states which hypotheses held, which failed, and what, if anything, to build next.

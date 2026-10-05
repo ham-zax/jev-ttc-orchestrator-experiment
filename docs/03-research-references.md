@@ -1,6 +1,6 @@
 # Research and Investigation References
 
-**Last reviewed:** 2026-10-05
+**Last reviewed:** 2026-10-06 (revision 2)
 
 This document is the external investigation map for the project. A future model or engineer should use it to recover the reasoning behind the design without needing the original conversation.
 
@@ -13,7 +13,7 @@ When taking over this project, read:
 3. `docs/01-design.md`
 4. `docs/02-implementation-plan.md`
 5. this document
-6. `docs/04-webhmf-environment.md` once it exists
+6. `docs/04-webhmf-environment.md` and `docs/05-experiment-protocol.md` once they exist
 
 External projects are references, not dependencies by default. Re-check their current docs and licenses before implementation because these tools are moving quickly.
 
@@ -184,6 +184,21 @@ Investigate on WebHMF:
 Project lesson:
 Pi is especially useful because harness and underlying model are separable. One Pi adapter may expose multiple worker configurations backed by different model families.
 
+## Claude Code
+
+- Official docs: https://docs.claude.com/en/docs/claude-code (re-check the current location; read the headless/programmatic mode and Agent SDK pages)
+
+Investigate on WebHMF:
+- `claude -p --output-format stream-json` event semantics,
+- session resume (`--resume` / `--continue`) for in-session correction,
+- Agent SDK vs CLI trade-off,
+- disabling or observing its own subagents (Task tool) during experiments,
+- usage reporting under the active login,
+- model selection.
+
+Project lesson:
+A first-class optional worker, critic, or reviewer. Most useful as a cross-family critic for OpenAI-family workers and vice versa. Never an architectural dependency.
+
 ## Ecosystem indexes
 
 - Awesome Agent Orchestrators:
@@ -201,16 +216,29 @@ Any project considered for code reuse still needs direct source, license, mainte
 
 - arXiv: https://arxiv.org/abs/2608.05643
 
-Investigate:
-- diminishing returns from wider sampling,
-- semantic diversity saturation,
-- breadth versus depth allocation,
-- critique/correction loops,
-- verifier-free aggregation,
-- benchmark configuration and limitations.
+Authors: Bilal, Mohsin, Umer, Trigg, Subhan, Ali, Hougen.
 
-Project lesson:
-Our v0 does not reproduce the paper. It takes one practical lesson: spend extra compute on refinement and genuinely different trajectories rather than blind repeated sampling.
+Facts extracted for this design (re-verify against the paper before citing):
+- Method: N independent rollouts (primary N=8, τ=0.7), each refined for D rounds (primary D=4) of reasoning continuation → self-critique → self-correction, using role-conditioned prompts on the same model; final answer by plurality vote; no external verifier.
+- Models: Qwen2.5-Math-7B-Instruct, Qwen2.5-1.5B, Ministral-8B, LLaMA-3.1-8B. Benchmarks: AIME24, AIME25, AMC, OlympiadBench, MATH500.
+- Headline: Qwen2.5-1.5B MATH500 29.6% (RM@8) → 58.0%; AMC 25.0% → 32.5%.
+- Resampling saturation: AIME-24 unique semantic clusters ≈1.2 at N=2 → ≈2.5 at N=32.
+- Critique ablation: removing explicit critique drops Qwen2.5-1.5B AIME25 6.67% → 0.0% and MATH500 58.0% → 55.6%.
+- Breadth/depth: no monotonic optimum (AMC23 32.5% at both (5,4) and (10,4)).
+- Compute: ≈17 accuracy points per 10³ extra TFLOPs for Qwen2.5-1.5B; only η≈1.16 for Qwen2.5-Math-7B over RM@8, so gains shrink for stronger models.
+- Limitations: higher inference cost; models can miss their own errors or degrade answers under naive refinement; per-rollout correction is noisy; evaluated only on math with well-defined answers.
+
+Project lessons (see `00-rationale.md` §"What we take from the paper"):
+- refine before resampling (L1 before L2),
+- explicit, structured critique as its own stage,
+- breadth ≤ 2, and diversity must be deliberate, not temperature,
+- replace voting with verifier score plus checkpoint revert (no regressions),
+- prefer a cross-family critic over self-critique,
+- include compute-matched resampling arms and accept a possible null result for frontier agents.
+
+Open questions:
+- Does the cluster-saturation result hold for coding approaches, not just math answers? (Measured by arms R vs R'.)
+- What is the coding analogue of per-depth recovery rate, and where does it flatten? (Measured by arm B per-round recovery.)
 
 ### Broader topics to research before extending v0
 
@@ -240,6 +268,8 @@ Before adding a new orchestrator, reviewer, search strategy, or worker:
 8. How would run reports show that it helped?
 9. Does WebHMF actually expose the integration surface being assumed?
 10. Are licensing and credential boundaries understood?
+11. Which experiment arm isolates its effect at matched compute?
+12. Does it respect the phase gates in `02-implementation-plan.md`?
 
 ## Canonical local authority
 
@@ -251,6 +281,7 @@ A future model should treat these files as project authority, in order:
 4. `docs/02-implementation-plan.md` — concrete execution sequence.
 5. `docs/03-research-references.md` — external investigation map.
 6. `docs/04-webhmf-environment.md` — actual workstation facts once created.
-7. Later decision records and experiment protocol documents.
+7. `docs/05-experiment-protocol.md` — corpus, arms, repeats, gate criteria.
+8. The revision log at the end of `docs/01-design.md`.
 
 If current external documentation conflicts with an old assumption in this repository, update the assumption explicitly rather than silently coding around it.
